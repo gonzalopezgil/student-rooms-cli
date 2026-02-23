@@ -1,8 +1,6 @@
-import configparser
 import os
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
-
 
 
 @dataclass
@@ -23,13 +21,14 @@ class FilterConfig:
 
 @dataclass
 class Semester1Rules:
-    name_keywords: List[str] = field(default_factory=lambda: [
-        "semester 1",
-        "sem 1",
-        "fall",
-        "autumn",
-    ])
+    # Strict keyword match for Semester 1 only by default
+    name_keywords: List[str] = field(default_factory=lambda: ["semester 1"])
     require_keyword: bool = True
+
+    # Optional date-shape constraints for Semester 1 windows
+    start_months: List[int] = field(default_factory=lambda: [9, 10])
+    end_months: List[int] = field(default_factory=lambda: [1, 2])
+    enforce_month_window: bool = True
 
 
 @dataclass
@@ -46,22 +45,23 @@ class PollingConfig:
 
 
 @dataclass
-class PushoverConfig:
-    enabled: bool = False
-    api_token: Optional[str] = None
-    user_key: Optional[str] = None
-
-
-@dataclass
 class OpenClawConfig:
     enabled: bool = False
-    endpoint: Optional[str] = None
-    api_key: Optional[str] = None
+    mode: str = "message"  # message | agent
+    channel: str = "telegram"
+    target: Optional[str] = None
+
+    # If true, create an immediate cron job for reservation assist/autobook
+    create_job_on_match: bool = False
+    reservation_mode: str = "assist"  # assist | autobook
+    job_model: str = "anthropic/claude-sonnet-4-6"
+    job_timeout_seconds: int = 600
+    job_channel: Optional[str] = None
+    job_target: Optional[str] = None
 
 
 @dataclass
 class NotificationConfig:
-    pushover: PushoverConfig = field(default_factory=PushoverConfig)
     openclaw: OpenClawConfig = field(default_factory=OpenClawConfig)
 
 
@@ -83,6 +83,18 @@ def _get_dict(data, key, default=None):
     return default or {}
 
 
+def _as_int_list(value, fallback):
+    if not isinstance(value, list):
+        return fallback
+    out = []
+    for item in value:
+        try:
+            out.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return out or fallback
+
+
 def _load_yaml(path: str) -> Tuple[dict, List[str]]:
     warnings = []
     if not os.path.exists(path):
@@ -93,24 +105,20 @@ def _load_yaml(path: str) -> Tuple[dict, List[str]]:
     except ImportError:
         warnings.append("PyYAML is not installed; skipping YAML config load.")
         return {}, warnings
+
     with open(path, "r", encoding="utf-8") as handle:
         data = yaml.safe_load(handle) or {}
+
     if not isinstance(data, dict):
         warnings.append("config.yaml root must be a mapping; using defaults.")
         return {}, warnings
     return data, warnings
 
 
-def _load_ini(path: str) -> configparser.ConfigParser:
-    parser = configparser.ConfigParser()
-    if os.path.exists(path):
-        parser.read(path)
-    return parser
-
-
-def load_config(yaml_path: str = "config.yaml", ini_path: str = "config.ini") -> Tuple[Config, List[str]]:
+def load_config(yaml_path: str = "config.yaml", ini_path: Optional[str] = None) -> Tuple[Config, List[str]]:
     data, warnings = _load_yaml(yaml_path)
-    ini = _load_ini(ini_path)
+    if ini_path:
+        warnings.append("config.ini compatibility path is deprecated and ignored (Pushover removed).")
 
     target_data = _get_dict(data, "target", {})
     filter_data = _get_dict(data, "filters", {})
@@ -118,7 +126,6 @@ def load_config(yaml_path: str = "config.yaml", ini_path: str = "config.ini") ->
     semester_data = _get_dict(academic_data, "semester1", {})
     polling_data = _get_dict(data, "polling", {})
     notify_data = _get_dict(data, "notifications", {})
-    pushover_data = _get_dict(notify_data, "pushover", {})
     openclaw_data = _get_dict(notify_data, "openclaw", {})
 
     config = Config(
@@ -141,7 +148,10 @@ def load_config(yaml_path: str = "config.yaml", ini_path: str = "config.ini") ->
                 name_keywords=semester_data.get("name_keywords")
                 if isinstance(semester_data.get("name_keywords"), list)
                 else Semester1Rules().name_keywords,
-                require_keyword=semester_data.get("require_keyword", True),
+                require_keyword=bool(semester_data.get("require_keyword", True)),
+                start_months=_as_int_list(semester_data.get("start_months"), [9, 10]),
+                end_months=_as_int_list(semester_data.get("end_months"), [1, 2]),
+                enforce_month_window=bool(semester_data.get("enforce_month_window", True)),
             ),
         ),
         polling=PollingConfig(
@@ -149,26 +159,19 @@ def load_config(yaml_path: str = "config.yaml", ini_path: str = "config.ini") ->
             jitter_seconds=int(polling_data.get("jitter_seconds", 30)),
         ),
         notifications=NotificationConfig(
-            pushover=PushoverConfig(
-                enabled=pushover_data.get("enabled", False),
-                api_token=pushover_data.get("api_token"),
-                user_key=pushover_data.get("user_key"),
-            ),
             openclaw=OpenClawConfig(
-                enabled=openclaw_data.get("enabled", False),
-                endpoint=openclaw_data.get("endpoint"),
-                api_key=openclaw_data.get("api_key"),
-            ),
+                enabled=bool(openclaw_data.get("enabled", False)),
+                mode=str(openclaw_data.get("mode", "message")),
+                channel=str(openclaw_data.get("channel", "telegram")),
+                target=openclaw_data.get("target"),
+                create_job_on_match=bool(openclaw_data.get("create_job_on_match", False)),
+                reservation_mode=str(openclaw_data.get("reservation_mode", "assist")),
+                job_model=str(openclaw_data.get("job_model", "anthropic/claude-sonnet-4-6")),
+                job_timeout_seconds=int(openclaw_data.get("job_timeout_seconds", 600)),
+                job_channel=openclaw_data.get("job_channel"),
+                job_target=openclaw_data.get("job_target"),
+            )
         ),
     )
-
-    if ini.has_section("Pushover"):
-        if not config.notifications.pushover.api_token:
-            config.notifications.pushover.api_token = ini.get("Pushover", "api_token", fallback=None)
-        if not config.notifications.pushover.user_key:
-            config.notifications.pushover.user_key = ini.get("Pushover", "user_key", fallback=None)
-
-    if config.notifications.pushover.api_token and config.notifications.pushover.user_key:
-        config.notifications.pushover.enabled = True
 
     return config, warnings

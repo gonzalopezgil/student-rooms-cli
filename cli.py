@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from client import YugoClient, find_by_name
-from matching import filter_room, get_monthly_price, match_semester1
+from matching import filter_room, get_weekly_price, is_ensuite, match_semester1
 from models.config import Config, load_config
 from notifier import notify, validate_notification_config
 
@@ -64,6 +64,7 @@ def resolve_city_id(
     resolved_country_id = resolve_country_id(client, config, country, country_id)
     if not resolved_country_id:
         return None
+
     cities = client.list_cities(resolved_country_id)
     match = find_by_name(cities, name)
     if match:
@@ -73,22 +74,27 @@ def resolve_city_id(
     return None
 
 
+def _to_js_date_string(date_str: str) -> str:
+    dt = datetime.strptime(date_str, "%Y-%m-%d")
+    # Backend-compatible format observed in booking-flow JS requests
+    return dt.strftime("%a %b %d %Y 00:00:00 GMT+0000 (UTC)")
+
+
 def format_record_message(record: Dict[str, Any]) -> str:
-    price_label = record.get("roomPriceLabel") or ""
-    monthly_price = get_monthly_price(record.get("roomData") or {})
-    price_detail = f"{price_label}"
-    if monthly_price is not None:
-        price_detail = f"{price_label} (~{monthly_price:.2f} per month)"
+    weekly = get_weekly_price(record.get("roomData") or {})
+    weekly_str = f"€{weekly:.2f}/week" if weekly is not None else (record.get("roomPriceLabel") or "N/A")
+    ensuite = "yes" if is_ensuite(record.get("roomData") or {}) else "no"
 
     return (
         f"Residence: {record.get('residenceName', 'Unknown')}\n"
-        f"Room: {record.get('roomName', 'Unknown')} - {price_detail}\n"
-        f"Tenancy: {record.get('optionName', 'Unknown')} - {record.get('optionFormattedLabel', '')}\n"
-        f"Dates: {record.get('optionStartDate', '')} -> {record.get('optionEndDate', '')}"
+        f"Room: {record.get('roomName', 'Unknown')}\n"
+        f"Ensuite: {ensuite}\n"
+        f"Price: {weekly_str}\n"
+        f"Tenancy: {record.get('optionName', 'Unknown')} ({record.get('optionStartDate', '')} -> {record.get('optionEndDate', '')})"
     )
 
 
-def collect_matches(client: YugoClient, city_id: str, config: Config) -> Tuple[List[Dict[str, Any]], int]:
+def collect_matches(client: YugoClient, city_id: str, config: Config, apply_semester_filter: bool = True) -> Tuple[List[Dict[str, Any]], int]:
     residences = client.list_residences(city_id)
     matches: List[Dict[str, Any]] = []
     option_count = 0
@@ -125,7 +131,8 @@ def collect_matches(client: YugoClient, city_id: str, config: Config) -> Tuple[L
                         "toYear": group.get("toYear"),
                         "tenancyOption": [option],
                     }
-                    if not match_semester1(option_wrapper, config.academic_year):
+
+                    if apply_semester_filter and not match_semester1(option_wrapper, config.academic_year):
                         continue
 
                     matches.append(
@@ -158,22 +165,27 @@ def collect_matches(client: YugoClient, city_id: str, config: Config) -> Tuple[L
     return matches, option_count
 
 
-def _to_js_date_string(date_str: str) -> str:
-    dt = datetime.strptime(date_str, "%Y-%m-%d")
-    # Mimic browser Date.toString format enough for Yugo backend parsing.
-    return dt.strftime("%a %b %d %Y 00:00:00 GMT+0000 (UTC)")
+def prioritize_matches(matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def key(item: Dict[str, Any]):
+        room = item.get("roomData") or {}
+        ensuite_rank = 0 if is_ensuite(room) else 1
+        weekly = get_weekly_price(room)
+        weekly_rank = weekly if weekly is not None else float("inf")
+        return (
+            ensuite_rank,
+            weekly_rank,
+            str(item.get("residenceName") or ""),
+            str(item.get("roomName") or ""),
+            str(item.get("optionName") or ""),
+        )
 
-
-def _safe_int_floor_index(value: Any) -> Optional[int]:
-    try:
-        return int(float(value))
-    except (TypeError, ValueError):
-        return None
+    return sorted(matches, key=key)
 
 
 def probe_booking_flow(client: YugoClient, match: Dict[str, Any]) -> Dict[str, Any]:
     residence_content_id = match["residenceContentId"]
-    # Warm booking session/cookies (required by some endpoints)
+
+    # Warm booking session/cookies required by some booking endpoints
     warm = client.session.get(client.base_url + "booking-flow-page", params={"residenceContentId": residence_content_id}, timeout=client.timeout)
     warm.raise_for_status()
 
@@ -184,9 +196,10 @@ def probe_booking_flow(client: YugoClient, match: Dict[str, Any]) -> Dict[str, A
     floor_indexes_set = set()
     for building in buildings:
         for floor in building.get("floors") or []:
-            idx = _safe_int_floor_index(floor.get("index"))
-            if idx is not None:
-                floor_indexes_set.add(idx)
+            try:
+                floor_indexes_set.add(int(float(floor.get("index"))))
+            except (TypeError, ValueError):
+                continue
     floor_indexes = sorted(floor_indexes_set)
 
     if not building_ids or not floor_indexes:
@@ -258,6 +271,8 @@ def probe_booking_flow(client: YugoClient, match: Dict[str, Any]) -> Dict[str, A
             "toYear": match.get("toYear"),
             "startDate": match.get("optionStartDate"),
             "endDate": match.get("optionEndDate"),
+            "ensuite": is_ensuite(match.get("roomData") or {}),
+            "weeklyPrice": get_weekly_price(match.get("roomData") or {}),
         },
         "bookingContext": {
             "commonParams": common_params,
@@ -280,6 +295,68 @@ def probe_booking_flow(client: YugoClient, match: Dict[str, Any]) -> Dict[str, A
             "paymentLink": match.get("residencePaymentLink"),
         },
     }
+
+
+def build_alert_message(ranked_matches: List[Dict[str, Any]], probe: Optional[Dict[str, Any]] = None) -> str:
+    top = ranked_matches[0]
+    top_weekly = get_weekly_price(top.get("roomData") or {})
+    top_weekly_str = f"€{top_weekly:.2f}/week" if top_weekly is not None else (top.get("roomPriceLabel") or "N/A")
+    top_ensuite = "✅" if is_ensuite(top.get("roomData") or {}) else "❌"
+
+    lines = [
+        "🚨 YUGO ALERT · Semester 1 detectado",
+        "",
+        "⭐ Opción prioritaria:",
+        f"- Residencia: {top.get('residenceName')}",
+        f"- Habitación: {top.get('roomName')}",
+        f"- Ensuite: {top_ensuite}",
+        f"- Precio: {top_weekly_str}",
+        f"- Fechas: {top.get('optionStartDate')} → {top.get('optionEndDate')}",
+        f"- Tenancy: {top.get('optionName')}",
+    ]
+
+    if probe:
+        if probe.get("links", {}).get("skipRoomLink"):
+            lines.append(f"- Link reserva: {probe['links']['skipRoomLink']}")
+        elif probe.get("links", {}).get("handoverLink"):
+            lines.append(f"- Link reserva: {probe['links']['handoverLink']}")
+
+    if len(ranked_matches) > 1:
+        lines.extend(["", "Alternativas (top 5):"])
+        for idx, item in enumerate(ranked_matches[:5], start=1):
+            w = get_weekly_price(item.get("roomData") or {})
+            w_str = f"€{w:.2f}/week" if w is not None else (item.get("roomPriceLabel") or "N/A")
+            en = "ensuite" if is_ensuite(item.get("roomData") or {}) else "no-ensuite"
+            lines.append(
+                f"{idx}. {item.get('residenceName')} | {item.get('roomName')} | {en} | {w_str} | {item.get('optionName')}"
+            )
+
+    return "\n".join(lines)
+
+
+def build_reservation_job_prompt(probe: Dict[str, Any], reservation_mode: str) -> str:
+    link = probe.get("links", {}).get("skipRoomLink") or probe.get("links", {}).get("handoverLink")
+    mode = reservation_mode.lower().strip()
+    if mode not in {"assist", "autobook"}:
+        mode = "assist"
+
+    guardrail = (
+        "Do NOT submit irreversible payment actions. Stop at final confirmation and notify Gonzalo."
+        if mode == "assist"
+        else "Attempt full booking flow. If payment confirmation is required, notify Gonzalo immediately before final submit."
+    )
+
+    return (
+        "You are a reservation execution agent.\n\n"
+        "A Yugo Semester 1 option was detected.\n"
+        f"Primary booking link: {link}\n\n"
+        "Steps:\n"
+        "1) Open the booking link in browser.\n"
+        "2) Complete the reservation flow as far as possible.\n"
+        "3) Keep all details consistent with detected tenancy (dates/option).\n"
+        f"4) {guardrail}\n"
+        "5) Send a concise status update to Gonzalo at the end."
+    )
 
 
 def handle_discover(args: argparse.Namespace, config: Config) -> int:
@@ -331,31 +408,42 @@ def handle_scan(args: argparse.Namespace, config: Config) -> int:
         print("City id is required (or set target.city/target.city_id in config.yaml).")
         return 2
 
-    matches, option_count = collect_matches(client, city_id, config)
+    matches, option_count = collect_matches(client, city_id, config, apply_semester_filter=not args.all_options)
+    ranked = prioritize_matches(matches)
 
     if args.json:
         print(
             json.dumps(
                 {
                     "scannedOptions": option_count,
-                    "matches": matches,
                     "matchCount": len(matches),
+                    "matches": ranked,
                 },
                 ensure_ascii=False,
                 indent=2,
             )
         )
     else:
-        if matches:
-            print("\n\n".join(format_record_message(match) for match in matches))
+        if ranked:
+            print("\n\n".join(format_record_message(match) for match in ranked[:10]))
         print(f"Scanned {option_count} tenancy options. Matches: {len(matches)}")
 
-    if args.notify and matches:
+    if args.notify and ranked:
         error = validate_notification_config(config.notifications)
         if error:
             print(error)
             return 2
-        notify("\n\n".join(format_record_message(match) for match in matches), config.notifications)
+
+        probe = None
+        try:
+            probe = probe_booking_flow(client, ranked[0])
+        except Exception as exc:
+            logger.warning("Booking probe failed for notification payload: %s", exc)
+
+        message = build_alert_message(ranked, probe)
+        job_prompt = build_reservation_job_prompt(probe, config.notifications.openclaw.reservation_mode) if probe else None
+        notify(message, config.notifications, reservation_job_prompt=job_prompt)
+
     return 0
 
 
@@ -372,9 +460,24 @@ def handle_watch(args: argparse.Namespace, config: Config) -> int:
 
     while True:
         matches, option_count = collect_matches(client, city_id, config)
+        ranked = prioritize_matches(matches)
         logger.info("Scanned %s tenancy options. Matches: %s", option_count, len(matches))
-        if matches and config.notifications:
-            notify("\n\n".join(format_record_message(match) for match in matches), config.notifications)
+
+        if ranked and config.notifications.openclaw.enabled:
+            error = validate_notification_config(config.notifications)
+            if not error:
+                probe = None
+                try:
+                    probe = probe_booking_flow(client, ranked[0])
+                except Exception as exc:
+                    logger.warning("Booking probe failed in watch loop: %s", exc)
+
+                message = build_alert_message(ranked, probe)
+                job_prompt = build_reservation_job_prompt(probe, config.notifications.openclaw.reservation_mode) if probe else None
+                notify(message, config.notifications, reservation_job_prompt=job_prompt)
+            else:
+                logger.error(error)
+
         sleep_for = interval + random.randint(0, jitter) if jitter else interval
         time.sleep(sleep_for)
 
@@ -387,6 +490,8 @@ def handle_test_match(args: argparse.Namespace, config: Config) -> int:
             {
                 "name": args.name,
                 "formattedLabel": args.label,
+                "startDate": args.start_date,
+                "endDate": args.end_date,
             }
         ],
     }
@@ -403,7 +508,8 @@ def handle_notify(args: argparse.Namespace, config: Config) -> int:
     if error:
         print(error)
         return 2
-    message = args.message or "Yugo Phase A notification test"
+
+    message = args.message or "Yugo notification test"
     notify(message, config.notifications)
     print("Notification dispatched (if enabled channels are configured).")
     return 0
@@ -416,7 +522,7 @@ def handle_probe_booking(args: argparse.Namespace, config: Config) -> int:
         print("City id is required (or set target.city/target.city_id in config.yaml).")
         return 2
 
-    matches, _ = collect_matches(client, city_id, config)
+    matches, _ = collect_matches(client, city_id, config, apply_semester_filter=not args.all_options)
     if not matches:
         print("No matches found with current semester/filter rules.")
         return 1
@@ -435,6 +541,7 @@ def handle_probe_booking(args: argparse.Namespace, config: Config) -> int:
         and _contains(match.get("roomName"), args.room)
         and _contains(match.get("optionName"), args.tenancy)
     ]
+    candidates = prioritize_matches(candidates)
 
     if not candidates:
         print("No match candidates after applying residence/room/tenancy filters.")
@@ -453,6 +560,15 @@ def handle_probe_booking(args: argparse.Namespace, config: Config) -> int:
         print(f"Booking probe failed: {exc}")
         return 1
 
+    if args.notify:
+        error = validate_notification_config(config.notifications)
+        if error:
+            print(error)
+            return 2
+        message = build_alert_message(candidates, probe)
+        job_prompt = build_reservation_job_prompt(probe, config.notifications.openclaw.reservation_mode)
+        notify(message, config.notifications, reservation_job_prompt=job_prompt)
+
     if args.json:
         print(json.dumps(probe, ensure_ascii=False, indent=2))
     else:
@@ -468,9 +584,8 @@ def handle_probe_booking(args: argparse.Namespace, config: Config) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="yugo", description="Yugo Phase A CLI")
+    parser = argparse.ArgumentParser(prog="yugo", description="Yugo CLI")
     parser.add_argument("--config", default="config.yaml", help="Path to YAML config.")
-    parser.add_argument("--config-ini", default="config.ini", help="Path to legacy INI config.")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -489,7 +604,8 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--country-id", help="Country id to use.")
     scan.add_argument("--city", help="City name to resolve.")
     scan.add_argument("--city-id", help="City id to use.")
-    scan.add_argument("--notify", action="store_true", help="Send notifications for matches.")
+    scan.add_argument("--all-options", action="store_true", help="Disable semester matching and return all options.")
+    scan.add_argument("--notify", action="store_true", help="Send notification for top prioritized match.")
     scan.add_argument("--json", action="store_true", help="Output JSON.")
 
     watch = subparsers.add_parser("watch", help="Poll the Yugo API on an interval.")
@@ -503,6 +619,8 @@ def build_parser() -> argparse.ArgumentParser:
     test_match.add_argument("--to-year", type=int, required=True, help="Tenancy toYear.")
     test_match.add_argument("--name", default="Semester 1", help="Tenancy option name.")
     test_match.add_argument("--label", default="Semester 1", help="Tenancy formatted label.")
+    test_match.add_argument("--start-date", default="2026-09-01", help="Tenancy startDate (YYYY-MM-DD).")
+    test_match.add_argument("--end-date", default="2027-01-31", help="Tenancy endDate (YYYY-MM-DD).")
     test_match.add_argument("--json", action="store_true", help="Output JSON.")
 
     notify_parser = subparsers.add_parser("notify", help="Send a test notification.")
@@ -516,10 +634,12 @@ def build_parser() -> argparse.ArgumentParser:
     probe.add_argument("--country-id", help="Country id to use.")
     probe.add_argument("--city", help="City name to resolve.")
     probe.add_argument("--city-id", help="City id to use.")
+    probe.add_argument("--all-options", action="store_true", help="Disable semester matching and allow probing any option.")
     probe.add_argument("--residence", help="Filter matched candidates by residence name contains.")
     probe.add_argument("--room", help="Filter matched candidates by room name contains.")
     probe.add_argument("--tenancy", help="Filter matched candidates by tenancy label contains.")
     probe.add_argument("--index", type=int, default=0, help="Candidate index after filters (default 0).")
+    probe.add_argument("--notify", action="store_true", help="Notify via configured OpenClaw channel.")
     probe.add_argument("--json", action="store_true", help="Output JSON.")
 
     return parser
@@ -530,7 +650,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    config, warnings = load_config(args.config, args.config_ini)
+    config, warnings = load_config(args.config)
     for warning in warnings:
         logger.warning(warning)
 

@@ -1,78 +1,53 @@
-# Yugo Scraper (Phase A)
+# Yugo Scraper (Agent-ready CLI)
 
-Yugo Scraper is a Python-based tool that discovers and monitors Yugo accommodation availability via the public Yugo API. Phase A delivers a non-interactive CLI foundation and matching logic without any booking or browser automation.
+Yugo Scraper is a Python CLI to discover, filter, and monitor Yugo accommodation options.
+It is designed so OpenClaw agents can operate it directly (scan, prioritize, generate booking links, notify, and optionally create follow-up jobs).
 
-## Phase A+ scope
+## What it does now
 
-- CLI-first workflow (`yugo discover`, `yugo scan`, `yugo watch`, `yugo test-match`, `yugo notify`, `yugo probe-booking`).
-- YAML configuration (`config.yaml`) with target, filters, academic-year matching, polling, and notification placeholders.
-- Modular architecture (client, matching, models/config, notifier, cli).
-- Minimal testing for Semester 1 matching logic.
-- Booking-flow probing endpoint support (available beds, flats with beds, skip-room, student-portal handover link generation).
-- No irreversible reservation checkout automation yet (browser-assisted handoff recommended).
-- Technical analysis for CLI-vs-browser booking split: `BOOKING_AUTOMATION_ANALYSIS.md`.
+- Non-interactive CLI workflow:
+  - `discover`
+  - `scan`
+  - `watch`
+  - `test-match`
+  - `notify`
+  - `probe-booking`
+- Strict Semester 1 matching policy (configurable).
+- Prioritization logic: **ensuite first**, then **cheapest**.
+- Booking-flow probing (CLI-first):
+  - `available-beds`
+  - `flats-with-beds`
+  - `skip-room-selection`
+  - `student-portal-redirect`
+- OpenClaw-native notifications and optional instant job creation.
+
+## Not in scope (yet)
+
+- Full irreversible checkout by pure API only. Final reservation completion usually continues in browser/student portal.
 
 ## Installation
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
 ## Configuration
 
-Primary configuration lives in `config.yaml`:
+Use `config.yaml` (or pass `--config <path>`).
 
-> For Dublin 26/27 tracking, use `config.dublin.26-27.sample.yaml` as a starting template.
+For Dublin 26/27 starter config, see:
 
+- `config.dublin.26-27.sample.yaml`
 
-```yaml
-target:
-  country: "United Kingdom"
-  city: "London"
+Key sections:
 
-filters:
-  private_bathroom: true
-  private_kitchen: false
-  max_weekly_price: null
-  max_monthly_price: 1200
-
-academic_year:
-  start_year: 2024
-  end_year: 2025
-  semester1:
-    name_keywords:
-      - "semester 1"
-      - "sem 1"
-      - "fall"
-      - "autumn"
-    require_keyword: true
-
-polling:
-  interval_seconds: 300
-  jitter_seconds: 30
-
-notifications:
-  pushover:
-    enabled: false
-    api_token: ""
-    user_key: ""
-  openclaw:
-    enabled: false
-    endpoint: ""
-    api_key: ""
-```
-
-Legacy `config.ini` (Pushover only) is still supported for backward compatibility:
-
-```ini
-[Pushover]
-api_token = YOUR_API_TOKEN_HERE
-user_key = YOUR_USER_KEY_HERE
-```
+- `academic_year.semester1.name_keywords`: strict matching tokens (default: only `semester 1`)
+- `academic_year.semester1.enforce_month_window`: enforce Sep/Oct -> Jan/Feb shape
+- `notifications.openclaw`: Telegram (or other channel) delivery + optional job creation
 
 ## Usage
-
-All commands are non-interactive. Use `--config` to point to a YAML file if needed.
 
 ```bash
 python main.py --help
@@ -82,53 +57,55 @@ python main.py --help
 
 ```bash
 python main.py discover --countries
-python main.py discover --cities --country "United Kingdom"
-python main.py discover --residences --city "London" --country "United Kingdom"
+python main.py discover --cities --country "Ireland"
+python main.py discover --residences --city "Dublin" --country "Ireland"
 ```
 
 ### Scan
 
 ```bash
-python main.py scan --city "London" --country "United Kingdom"
-python main.py scan --city-id 12345 --notify
-python main.py scan --city "Dublin" --country "Ireland" --json
+# strict Semester 1 (default from config)
+python main.py scan --city "Dublin" --country "Ireland"
+
+# debugging / current market inventory regardless of semester rules
+python main.py scan --city "Dublin" --country "Ireland" --all-options --json
 ```
 
-### Watch
+### Watch loop
 
 ```bash
-python main.py watch --city "London" --country "United Kingdom"
+python main.py watch --city "Dublin" --country "Ireland"
 ```
 
-### Probe booking flow (CLI-first handover)
+### Probe booking flow (generate booking link + context)
 
 ```bash
-# Uses current config filters/matching; picks first candidate
-python main.py probe-booking --city "Dublin" --country "Ireland"
+# strict matches from config
+python main.py probe-booking --city "Dublin" --country "Ireland" --json
 
-# Narrow candidate and output machine-readable JSON (for agents)
+# force current available options (useful for testing)
 python main.py probe-booking \
   --city "Dublin" --country "Ireland" \
-  --residence "Dominick" --room "Classic" --tenancy "41 Weeks" \
-  --json
+  --all-options --tenancy "41 Weeks" --residence "Dominick" --json
 ```
 
-### Test matching
+### Notification test
 
 ```bash
-python main.py test-match --from-year 2024 --to-year 2025 --name "Semester 1" --label "Semester 1 (Fall)"
+python main.py notify --message "Yugo test"
 ```
 
-### Notifications
+## Notes for agents
 
-```bash
-python main.py notify --message "Yugo Phase A notification test"
-```
+- Prefer `probe-booking --json` before browser automation.
+- Use returned `skipRoomLink`/`handoverLink` as entry point to student portal booking process.
+- If `notifications.openclaw.create_job_on_match=true`, scanner can auto-create an immediate isolated OpenClaw job.
+
+## Reference docs
+
+- `MIGRATION_PHASE_A.md`
+- `BOOKING_AUTOMATION_ANALYSIS.md`
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## Disclaimer
-
-This tool is intended for personal use and educational purposes. Please use it responsibly and adhere to the Yugo platform's terms of service.
+MIT (see `LICENSE`).

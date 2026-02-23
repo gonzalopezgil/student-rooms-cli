@@ -12,26 +12,28 @@ academic_year:
   start_year: 2026
   end_year: 2027
   semester1:
-    # Strict label matching (current Yugo labels observed: 38/41/51 Weeks)
+    # Strict policy requested:
+    # ONLY literal Semester 1 labels (no 38/41 weeks fallback)
     name_keywords:
       - "semester 1"
-      - "sem 1"
-      - "autumn"
-      - "fall"
-      - "41 weeks"
-      - "38 weeks"
     require_keyword: true
+    enforce_month_window: true
+    start_months: [9, 10]
+    end_months: [1, 2]
 
 polling:
   interval_seconds: 60
   jitter_seconds: 15
 
 notifications:
-  pushover:
-    enabled: false
-    api_token: ""
-    user_key: ""
   openclaw:
-    enabled: false
-    endpoint: ""
-    api_key: ""
+    enabled: true
+    mode: "message"
+    channel: "telegram"
+    target: "1473631236"
+
+    # If true, create an instant isolated OpenClaw job for reservation assist/autobook.
+    create_job_on_match: true
+    reservation_mode: "assist" # assist | autobook
+    job_model: "anthropic/claude-sonnet-4-6"
+    job_timeout_seconds: 600

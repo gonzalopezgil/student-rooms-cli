@@ -1,37 +1,43 @@
-# Migration: Phase A CLI
+# Migration: Phase A+ CLI
 
 ## Overview
 
-Phase A replaces the interactive console flow with a CLI-first, non-interactive foundation. The scraper still reads the Yugo API and applies matching/filtering rules, but no booking or browser automation is included.
+The project migrated from interactive prompts to an agent-friendly CLI foundation.
+Phase A+ adds booking-flow probing and OpenClaw-native notification/job orchestration.
 
 ## Architecture
 
-- `client.py`: thin HTTP client for Yugo endpoints (countries, cities, residences, rooms, tenancy options).
-- `matching.py`: room filters and Semester 1 matching logic.
-- `models/config.py`: YAML/INI configuration models and loader.
-- `notifier.py`: Pushover sender + OpenClaw placeholder trigger.
+- `client.py`: HTTP client for discovery + booking-flow endpoints.
+- `matching.py`: room filters + strict Semester 1 matching policy.
+- `models/config.py`: YAML config models and loader.
+- `notifier.py`: OpenClaw message/agent delivery + optional cron job creation.
 - `cli.py`: command dispatch (`discover`, `scan`, `watch`, `test-match`, `notify`, `probe-booking`).
 - `main.py`: CLI entrypoint.
 
-## Configuration flow
+## Key behavior changes
 
-- `config.yaml` is the primary configuration file.
-- `config.ini` is still accepted for legacy Pushover credentials when YAML is absent or missing them.
-- Command-line flags can override target location resolution on a per-run basis.
+- Removed legacy Python mobile notification flow (Pushover/config.ini path deprecated).
+- Added strict Semester 1 constraints:
+  - keyword match (`semester 1`)
+  - month-window enforcement (Sep/Oct -> Jan/Feb)
+- Added prioritization strategy for candidate selection:
+  - ensuite first
+  - cheapest weekly price next
+- Added booking-flow probe command to produce actionable student-portal links.
+- Added optional immediate OpenClaw reservation jobs on match.
 
 ## CLI summary
 
-- `discover`: list countries, cities, or residences.
-- `scan`: run a single scan and print matches.
-- `watch`: poll periodically using `polling.interval_seconds` and `polling.jitter_seconds`.
-- `test-match`: quick check of Semester 1 matching rules.
-- `notify`: send a test notification to configured channels.
-- `probe-booking`: probe booking endpoints and return student-portal handover links for a matched option.
+- `discover`: list countries/cities/residences.
+- `scan`: single pass, optional notify, optional `--all-options`.
+- `watch`: polling loop with optional notifications/jobs.
+- `test-match`: validate Semester 1 policy quickly.
+- `notify`: send a direct OpenClaw notification test.
+- `probe-booking`: generate booking links/context for a selected match.
 
-## Next steps (Phase B/C)
+## Next steps
 
-- Add persistent state to avoid duplicate notifications.
-- Extend matching rules to cover multiple semesters and custom date ranges.
-- Implement booking automation or external integrations (OpenClaw triggers).
-- Package CLI as an installable `yugo` console script.
-- Add integration tests with mocked API responses.
+- Persist dedup state to avoid repeated alerts for identical option fingerprints.
+- Add lock/cooldown for job creation to avoid duplicate reservation jobs.
+- Add browser-assist runner command that consumes `probe-booking` JSON directly.
+- Add integration tests with mocked Yugo API responses.

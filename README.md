@@ -1,40 +1,63 @@
-# Yugo Scraper 🏘️
+# Yugo Scraper (Phase A)
 
-Yugo Scraper is a Python-based tool 🛠 designed to help students find accommodations 🏠 by scraping the [Yugo](https://yugo.com/en-gb/home) platform. It allows users to filter residences by various criteria such as city, room arrangements, price, and tenancy dates. Additionally, it supports notifications on the phone 📱 through Pushover to keep users updated on new matching room options.
+Yugo Scraper is a Python-based tool that discovers and monitors Yugo accommodation availability via the public Yugo API. Phase A delivers a non-interactive CLI foundation and matching logic without any booking or browser automation.
 
-## 🌟 Features
+## Phase A scope
 
-- **City-wise Search**: The tool allows searching for accommodations in different cities 🏙 available on the Yugo platform.
-- **Residence Filtering**: Users can specify preferences for room arrangements (e.g., private bathroom/kitchen), price range 💸, and tenancy dates 📅.
-- **Console UI**: A user-friendly console interface guides users through the process of setting their preferences and displays matching accommodations 🖥.
-- **Notifications**: Users can opt-in to receive real-time notifications on the phone via Pushover 📲 when new rooms that match their preferences are found.
+- CLI-first workflow (`yugo discover`, `yugo scan`, `yugo watch`, `yugo test-match`, `yugo notify`).
+- YAML configuration (`config.yaml`) with target, filters, academic-year matching, polling, and notification placeholders.
+- Modular architecture (client, matching, models/config, notifier, cli).
+- Minimal testing for Semester 1 matching logic.
+- No reservation or booking automation.
 
-## 💿 Installation
-
-1. Clone this repository:
-
-```bash
-git clone https://github.com/gonzalopezgil/yugo-scraper.git
-```
-
-2. Navigate to the cloned directory:
-
-```bash
-cd yugo-scraper
-```
-
-3. Install the required Python packages:
+## Installation
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## 🔧 Configuration
+## Configuration
 
-Before using the scraper, you must set up your Pushover API credentials for receiving notifications:
+Primary configuration lives in `config.yaml`:
 
-1. Open the `config.ini` file.
-2. Enter your Pushover `api_token` and `user_key` in the respective fields.
+```yaml
+target:
+  country: "United Kingdom"
+  city: "London"
+
+filters:
+  private_bathroom: true
+  private_kitchen: false
+  max_weekly_price: null
+  max_monthly_price: 1200
+
+academic_year:
+  start_year: 2024
+  end_year: 2025
+  semester1:
+    name_keywords:
+      - "semester 1"
+      - "sem 1"
+      - "fall"
+      - "autumn"
+    require_keyword: true
+
+polling:
+  interval_seconds: 300
+  jitter_seconds: 30
+
+notifications:
+  pushover:
+    enabled: false
+    api_token: ""
+    user_key: ""
+  openclaw:
+    enabled: false
+    endpoint: ""
+    api_key: ""
+```
+
+Legacy `config.ini` (Pushover only) is still supported for backward compatibility:
 
 ```ini
 [Pushover]
@@ -42,43 +65,51 @@ api_token = YOUR_API_TOKEN_HERE
 user_key = YOUR_USER_KEY_HERE
 ```
 
-## 🚀 Usage
+## Usage
 
-Run the main script from the command line:
+All commands are non-interactive. Use `--config` to point to a YAML file if needed.
 
 ```bash
-python main.py
+python main.py --help
 ```
 
-Follow the prompts in the console UI to set your accommodation preferences. If you choose to receive notifications, make sure your Pushover credentials are correctly set up in the `config.ini` file.
+### Discover
 
-## 📦 Dependencies
+```bash
+python main.py discover --countries
+python main.py discover --cities --country "United Kingdom"
+python main.py discover --residences --city "London" --country "United Kingdom"
+```
 
-Yugo Scraper relies on the following Python packages:
+### Scan
 
-- requests
-- schedule
-- colorama
-- tqdm
+```bash
+python main.py scan --city "London" --country "United Kingdom"
+python main.py scan --city-id 12345 --notify
+```
 
-These dependencies are listed in `requirements.txt` and can be installed using `pip`.
+### Watch
 
-## 🔑 Renting with Yugo
+```bash
+python main.py watch --city "London" --country "United Kingdom"
+```
 
-For renting accommodations through Yugo, please visit their official booking page:
+### Test matching
 
-[https://yugo.com/en-gb/booking-flow-page](https://yugo.com/en-gb/booking-flow-page)
+```bash
+python main.py test-match --from-year 2024 --to-year 2025 --name "Semester 1" --label "Semester 1 (Fall)"
+```
 
-By accessing this website, you can enter your accommodation preferences and find the rooms you've identified using this software. This is the next step for proceeding with your booking on the Yugo platform.
+### Notifications
 
-## :octocat: Contributing
+```bash
+python main.py notify --message "Yugo Phase A notification test"
+```
 
-Contributions to Yugo Scraper are welcome! Please feel free to fork the repository, make your changes, and submit a pull request.
+## License
 
-## 📃 License
+This project is licensed under the MIT License - see the LICENSE file for details.
 
-This project is licensed under the [MIT License](https://opensource.org/license/mit/) - see the LICENSE file for details.
-
-## ⚠️ Disclaimer
+## Disclaimer
 
 This tool is intended for personal use and educational purposes. Please use it responsibly and adhere to the Yugo platform's terms of service.

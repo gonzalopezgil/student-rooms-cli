@@ -1,0 +1,36 @@
+target:
+  country: "United Kingdom"
+  city: "London"
+  # country_id: ""
+  # city_id: ""
+
+filters:
+  private_bathroom: true
+  private_kitchen: false
+  max_weekly_price: null
+  max_monthly_price: 1200
+
+academic_year:
+  start_year: 2024
+  end_year: 2025
+  semester1:
+    name_keywords:
+      - "semester 1"
+      - "sem 1"
+      - "fall"
+      - "autumn"
+    require_keyword: true
+
+polling:
+  interval_seconds: 300
+  jitter_seconds: 30
+
+notifications:
+  pushover:
+    enabled: false
+    api_token: ""
+    user_key: ""
+  openclaw:
+    enabled: false
+    endpoint: ""
+    api_key: ""

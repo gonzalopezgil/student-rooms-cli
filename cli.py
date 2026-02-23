@@ -1,9 +1,11 @@
 import argparse
+import json
 import logging
 import random
 import sys
 import time
-from typing import Dict, List, Optional, Tuple
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
 
 from client import YugoClient, find_by_name
 from matching import filter_room, get_monthly_price, match_semester1
@@ -71,23 +73,24 @@ def resolve_city_id(
     return None
 
 
-def format_option_message(residence: Dict, room: Dict, option: Dict) -> str:
-    tenancy = (option.get("tenancyOption") or [{}])[0]
-    price_label = room.get("priceLabel") or ""
-    monthly_price = get_monthly_price(room)
+def format_record_message(record: Dict[str, Any]) -> str:
+    price_label = record.get("roomPriceLabel") or ""
+    monthly_price = get_monthly_price(record.get("roomData") or {})
     price_detail = f"{price_label}"
     if monthly_price is not None:
         price_detail = f"{price_label} (~{monthly_price:.2f} per month)"
+
     return (
-        f"Residence: {residence.get('name', 'Unknown')}\n"
-        f"Room: {room.get('name', 'Unknown')} - {price_detail}\n"
-        f"Tenancy: {tenancy.get('name', 'Unknown')} - {tenancy.get('formattedLabel', '')}"
+        f"Residence: {record.get('residenceName', 'Unknown')}\n"
+        f"Room: {record.get('roomName', 'Unknown')} - {price_detail}\n"
+        f"Tenancy: {record.get('optionName', 'Unknown')} - {record.get('optionFormattedLabel', '')}\n"
+        f"Dates: {record.get('optionStartDate', '')} -> {record.get('optionEndDate', '')}"
     )
 
 
-def scan_city(client: YugoClient, city_id: str, config: Config) -> Tuple[List[str], int]:
+def collect_matches(client: YugoClient, city_id: str, config: Config) -> Tuple[List[Dict[str, Any]], int]:
     residences = client.list_residences(city_id)
-    messages: List[str] = []
+    matches: List[Dict[str, Any]] = []
     option_count = 0
 
     for residence in residences:
@@ -104,25 +107,191 @@ def scan_city(client: YugoClient, city_id: str, config: Config) -> Tuple[List[st
             room_id = room.get("id")
             if not room_id:
                 continue
-            options = client.list_tenancy_options(str(residence_id), str(residence_content_id), str(room_id))
-            if not options:
+
+            groups = client.list_tenancy_options(str(residence_id), str(residence_content_id), str(room_id))
+            if not groups:
                 continue
 
-            for option in options:
-                option_count += 1
-                if not match_semester1(option, config.academic_year):
+            for group in groups:
+                options = group.get("tenancyOption") or []
+                if not options:
                     continue
-                messages.append(format_option_message(residence, room, option))
 
-    return messages, option_count
+                option_count += len(options)
+
+                for option in options:
+                    option_wrapper = {
+                        "fromYear": group.get("fromYear"),
+                        "toYear": group.get("toYear"),
+                        "tenancyOption": [option],
+                    }
+                    if not match_semester1(option_wrapper, config.academic_year):
+                        continue
+
+                    matches.append(
+                        {
+                            "residenceId": str(residence_id),
+                            "residenceContentId": str(residence_content_id),
+                            "residenceName": residence.get("name"),
+                            "residenceLocationInfo": residence.get("locationInfo"),
+                            "residencePaymentLink": residence.get("paymentLink"),
+                            "residencePortalLink": residence.get("portalLink"),
+                            "roomId": str(room_id),
+                            "roomName": room.get("name"),
+                            "roomPriceLabel": room.get("priceLabel"),
+                            "roomMaxNumOfBedsInFlat": room.get("maxNumOfBedsInFlat"),
+                            "roomData": room,
+                            "optionId": str(option.get("id")) if option.get("id") else None,
+                            "optionName": option.get("name"),
+                            "optionFormattedLabel": option.get("formattedLabel"),
+                            "optionStartDate": option.get("startDate"),
+                            "optionEndDate": option.get("endDate"),
+                            "optionTenancyLength": option.get("tenancyLength"),
+                            "optionStatus": option.get("status"),
+                            "optionLinkToRedirect": option.get("linkToRedirect"),
+                            "academicYearId": group.get("academicYearId"),
+                            "fromYear": group.get("fromYear"),
+                            "toYear": group.get("toYear"),
+                        }
+                    )
+
+    return matches, option_count
+
+
+def _to_js_date_string(date_str: str) -> str:
+    dt = datetime.strptime(date_str, "%Y-%m-%d")
+    # Mimic browser Date.toString format enough for Yugo backend parsing.
+    return dt.strftime("%a %b %d %Y 00:00:00 GMT+0000 (UTC)")
+
+
+def _safe_int_floor_index(value: Any) -> Optional[int]:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def probe_booking_flow(client: YugoClient, match: Dict[str, Any]) -> Dict[str, Any]:
+    residence_content_id = match["residenceContentId"]
+    # Warm booking session/cookies (required by some endpoints)
+    warm = client.session.get(client.base_url + "booking-flow-page", params={"residenceContentId": residence_content_id}, timeout=client.timeout)
+    warm.raise_for_status()
+
+    property_data = client.get_residence_property(match["residenceId"])
+    buildings = ((property_data.get("property") or {}).get("buildings") or [])
+    building_ids = [b.get("id") for b in buildings if b.get("id")]
+
+    floor_indexes_set = set()
+    for building in buildings:
+        for floor in building.get("floors") or []:
+            idx = _safe_int_floor_index(floor.get("index"))
+            if idx is not None:
+                floor_indexes_set.add(idx)
+    floor_indexes = sorted(floor_indexes_set)
+
+    if not building_ids or not floor_indexes:
+        raise RuntimeError("Could not resolve building/floor metadata for booking probe.")
+
+    start_date_js = _to_js_date_string(match["optionStartDate"])
+    end_date_js = _to_js_date_string(match["optionEndDate"])
+
+    common_params = {
+        "roomTypeId": match["roomId"],
+        "residenceExternalId": match["residenceId"],
+        "tenancyOptionId": match["optionId"],
+        "tenancyStartDate": start_date_js,
+        "tenancyEndDate": end_date_js,
+        "academicYearId": match["academicYearId"],
+        "maxNumOfFlatmates": str(match.get("roomMaxNumOfBedsInFlat") or 7),
+        "buildingIds": ",".join(building_ids),
+        "floorIndexes": ",".join(str(i) for i in floor_indexes),
+    }
+
+    available_beds = client.get_available_beds(common_params)
+
+    flats_with_beds_params = {
+        **common_params,
+        "sortDirection": "false",
+        "pageNumber": "1",
+        "pageSize": "6",
+        "totalPriceOriginal": "0",
+        "pricePerNightOriginal": str((match.get("roomData") or {}).get("minPricePerNight") or ""),
+    }
+
+    flats_with_beds = client.get_flats_with_beds(flats_with_beds_params)
+
+    selected_bed_id = None
+    selected_flat_id = None
+    floors = ((flats_with_beds.get("flats") or {}).get("floors") or [])
+    for floor in floors:
+        for flat in floor.get("flats") or []:
+            beds = flat.get("beds") or []
+            if beds:
+                selected_bed_id = beds[0].get("bedId") or beds[0].get("id")
+                selected_flat_id = flat.get("id")
+                break
+        if selected_bed_id:
+            break
+
+    skip_room = client.get_skip_room_selection(common_params)
+
+    handover_payload = {
+        "roomTypeId": match["roomId"],
+        "residenceExternalId": match["residenceId"],
+        "tenancyOptionId": match["optionId"],
+        "tenancyStartDate": start_date_js,
+        "tenancyEndDate": end_date_js,
+        "academicYearId": match["academicYearId"],
+        "bedId": selected_bed_id or "",
+        "flatId": selected_flat_id or "",
+        "currencyCode": "EUR",
+    }
+
+    handover = client.post_student_portal_redirect(handover_payload)
+
+    return {
+        "match": {
+            "residence": match.get("residenceName"),
+            "room": match.get("roomName"),
+            "tenancy": match.get("optionName"),
+            "fromYear": match.get("fromYear"),
+            "toYear": match.get("toYear"),
+            "startDate": match.get("optionStartDate"),
+            "endDate": match.get("optionEndDate"),
+        },
+        "bookingContext": {
+            "commonParams": common_params,
+            "selectedBedId": selected_bed_id,
+            "selectedFlatId": selected_flat_id,
+        },
+        "apiResults": {
+            "availableBeds": available_beds,
+            "flatsWithBedsSummary": {
+                "floorsReturned": len(floors),
+                "hasPreferenceFilters": bool(((flats_with_beds.get("flats") or {}).get("preferenceFilters"))),
+            },
+            "skipRoomSelection": skip_room,
+            "studentPortalRedirect": handover,
+        },
+        "links": {
+            "skipRoomLink": skip_room.get("linkToRedirect"),
+            "handoverLink": handover.get("linkToRedirect"),
+            "portalLink": match.get("residencePortalLink"),
+            "paymentLink": match.get("residencePaymentLink"),
+        },
+    }
 
 
 def handle_discover(args: argparse.Namespace, config: Config) -> int:
     client = YugoClient()
+
     if args.countries:
         countries = client.list_countries()
-        for item in countries:
-            print(f"{item.get('countryId') or item.get('id')}\t{item.get('name')}")
+        if args.json:
+            print(json.dumps(countries, ensure_ascii=False, indent=2))
+        else:
+            for item in countries:
+                print(f"{item.get('countryId') or item.get('id')}\t{item.get('name')}")
         return 0
 
     if args.cities:
@@ -131,8 +300,11 @@ def handle_discover(args: argparse.Namespace, config: Config) -> int:
             print("Country id is required (or set target.country/target.country_id in config.yaml).")
             return 2
         cities = client.list_cities(country_id)
-        for item in cities:
-            print(f"{item.get('contentId') or item.get('id')}\t{item.get('name')}")
+        if args.json:
+            print(json.dumps(cities, ensure_ascii=False, indent=2))
+        else:
+            for item in cities:
+                print(f"{item.get('contentId') or item.get('id')}\t{item.get('name')}")
         return 0
 
     if args.residences:
@@ -141,8 +313,11 @@ def handle_discover(args: argparse.Namespace, config: Config) -> int:
             print("City id is required (or set target.city/target.city_id in config.yaml).")
             return 2
         residences = client.list_residences(city_id)
-        for item in residences:
-            print(f"{item.get('id')}\t{item.get('name')}")
+        if args.json:
+            print(json.dumps(residences, ensure_ascii=False, indent=2))
+        else:
+            for item in residences:
+                print(f"{item.get('id')}\t{item.get('name')}")
         return 0
 
     print("No discover target provided. Use --countries, --cities, or --residences.")
@@ -156,17 +331,31 @@ def handle_scan(args: argparse.Namespace, config: Config) -> int:
         print("City id is required (or set target.city/target.city_id in config.yaml).")
         return 2
 
-    messages, option_count = scan_city(client, city_id, config)
-    if messages:
-        print("\n\n".join(messages))
-    print(f"Scanned {option_count} tenancy options. Matches: {len(messages)}")
+    matches, option_count = collect_matches(client, city_id, config)
 
-    if args.notify and messages:
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "scannedOptions": option_count,
+                    "matches": matches,
+                    "matchCount": len(matches),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    else:
+        if matches:
+            print("\n\n".join(format_record_message(match) for match in matches))
+        print(f"Scanned {option_count} tenancy options. Matches: {len(matches)}")
+
+    if args.notify and matches:
         error = validate_notification_config(config.notifications)
         if error:
             print(error)
             return 2
-        notify("\n\n".join(messages), config.notifications)
+        notify("\n\n".join(format_record_message(match) for match in matches), config.notifications)
     return 0
 
 
@@ -182,10 +371,10 @@ def handle_watch(args: argparse.Namespace, config: Config) -> int:
     print(f"Starting watch loop: interval={interval}s jitter={jitter}s")
 
     while True:
-        messages, option_count = scan_city(client, city_id, config)
-        logger.info("Scanned %s tenancy options. Matches: %s", option_count, len(messages))
-        if messages and config.notifications:
-            notify("\n\n".join(messages), config.notifications)
+        matches, option_count = collect_matches(client, city_id, config)
+        logger.info("Scanned %s tenancy options. Matches: %s", option_count, len(matches))
+        if matches and config.notifications:
+            notify("\n\n".join(format_record_message(match) for match in matches), config.notifications)
         sleep_for = interval + random.randint(0, jitter) if jitter else interval
         time.sleep(sleep_for)
 
@@ -202,7 +391,10 @@ def handle_test_match(args: argparse.Namespace, config: Config) -> int:
         ],
     }
     matched = match_semester1(option, config.academic_year)
-    print("MATCH" if matched else "NO MATCH")
+    if args.json:
+        print(json.dumps({"match": bool(matched)}, ensure_ascii=False))
+    else:
+        print("MATCH" if matched else "NO MATCH")
     return 0
 
 
@@ -211,9 +403,67 @@ def handle_notify(args: argparse.Namespace, config: Config) -> int:
     if error:
         print(error)
         return 2
-    message = args.message or "Yugo Phase A test notification"
+    message = args.message or "Yugo Phase A notification test"
     notify(message, config.notifications)
     print("Notification dispatched (if enabled channels are configured).")
+    return 0
+
+
+def handle_probe_booking(args: argparse.Namespace, config: Config) -> int:
+    client = YugoClient()
+    city_id = resolve_city_id(client, config, args.city, args.city_id, args.country, args.country_id)
+    if not city_id:
+        print("City id is required (or set target.city/target.city_id in config.yaml).")
+        return 2
+
+    matches, _ = collect_matches(client, city_id, config)
+    if not matches:
+        print("No matches found with current semester/filter rules.")
+        return 1
+
+    def _contains(value: Optional[str], needle: Optional[str]) -> bool:
+        if not needle:
+            return True
+        if not value:
+            return False
+        return needle.strip().lower() in value.strip().lower()
+
+    candidates = [
+        match
+        for match in matches
+        if _contains(match.get("residenceName"), args.residence)
+        and _contains(match.get("roomName"), args.room)
+        and _contains(match.get("optionName"), args.tenancy)
+    ]
+
+    if not candidates:
+        print("No match candidates after applying residence/room/tenancy filters.")
+        return 1
+
+    idx = max(0, args.index)
+    if idx >= len(candidates):
+        print(f"Index {idx} out of range. Candidates: {len(candidates)}")
+        return 2
+
+    selected = candidates[idx]
+
+    try:
+        probe = probe_booking_flow(client, selected)
+    except Exception as exc:
+        print(f"Booking probe failed: {exc}")
+        return 1
+
+    if args.json:
+        print(json.dumps(probe, ensure_ascii=False, indent=2))
+    else:
+        print("Booking probe OK")
+        print(f"- Residence: {probe['match']['residence']}")
+        print(f"- Room: {probe['match']['room']}")
+        print(f"- Tenancy: {probe['match']['tenancy']} ({probe['match']['startDate']} -> {probe['match']['endDate']})")
+        print(f"- Available beds: {(probe['apiResults']['availableBeds'].get('available-beds') or {}).get('count')}")
+        print(f"- Skip-room link: {probe['links']['skipRoomLink']}")
+        print(f"- Handover link: {probe['links']['handoverLink']}")
+
     return 0
 
 
@@ -232,6 +482,7 @@ def build_parser() -> argparse.ArgumentParser:
     discover.add_argument("--country-id", help="Country id to use.")
     discover.add_argument("--city", help="City name to resolve.")
     discover.add_argument("--city-id", help="City id to use.")
+    discover.add_argument("--json", action="store_true", help="Output JSON.")
 
     scan = subparsers.add_parser("scan", help="Run a single scan against the Yugo API.")
     scan.add_argument("--country", help="Country name to resolve.")
@@ -239,6 +490,7 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--city", help="City name to resolve.")
     scan.add_argument("--city-id", help="City id to use.")
     scan.add_argument("--notify", action="store_true", help="Send notifications for matches.")
+    scan.add_argument("--json", action="store_true", help="Output JSON.")
 
     watch = subparsers.add_parser("watch", help="Poll the Yugo API on an interval.")
     watch.add_argument("--country", help="Country name to resolve.")
@@ -251,9 +503,24 @@ def build_parser() -> argparse.ArgumentParser:
     test_match.add_argument("--to-year", type=int, required=True, help="Tenancy toYear.")
     test_match.add_argument("--name", default="Semester 1", help="Tenancy option name.")
     test_match.add_argument("--label", default="Semester 1", help="Tenancy formatted label.")
+    test_match.add_argument("--json", action="store_true", help="Output JSON.")
 
     notify_parser = subparsers.add_parser("notify", help="Send a test notification.")
     notify_parser.add_argument("--message", help="Message to send.")
+
+    probe = subparsers.add_parser(
+        "probe-booking",
+        help="Probe booking-flow endpoints for a matched option and return booking links/metadata.",
+    )
+    probe.add_argument("--country", help="Country name to resolve.")
+    probe.add_argument("--country-id", help="Country id to use.")
+    probe.add_argument("--city", help="City name to resolve.")
+    probe.add_argument("--city-id", help="City id to use.")
+    probe.add_argument("--residence", help="Filter matched candidates by residence name contains.")
+    probe.add_argument("--room", help="Filter matched candidates by room name contains.")
+    probe.add_argument("--tenancy", help="Filter matched candidates by tenancy label contains.")
+    probe.add_argument("--index", type=int, default=0, help="Candidate index after filters (default 0).")
+    probe.add_argument("--json", action="store_true", help="Output JSON.")
 
     return parser
 
@@ -273,6 +540,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "watch": handle_watch,
         "test-match": handle_test_match,
         "notify": handle_notify,
+        "probe-booking": handle_probe_booking,
     }
 
     handler = handlers.get(args.command)

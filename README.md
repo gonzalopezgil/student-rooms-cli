@@ -2,13 +2,15 @@
 
 Yugo Scraper is a Python-based tool that discovers and monitors Yugo accommodation availability via the public Yugo API. Phase A delivers a non-interactive CLI foundation and matching logic without any booking or browser automation.
 
-## Phase A scope
+## Phase A+ scope
 
-- CLI-first workflow (`yugo discover`, `yugo scan`, `yugo watch`, `yugo test-match`, `yugo notify`).
+- CLI-first workflow (`yugo discover`, `yugo scan`, `yugo watch`, `yugo test-match`, `yugo notify`, `yugo probe-booking`).
 - YAML configuration (`config.yaml`) with target, filters, academic-year matching, polling, and notification placeholders.
 - Modular architecture (client, matching, models/config, notifier, cli).
 - Minimal testing for Semester 1 matching logic.
-- No reservation or booking automation.
+- Booking-flow probing endpoint support (available beds, flats with beds, skip-room, student-portal handover link generation).
+- No irreversible reservation checkout automation yet (browser-assisted handoff recommended).
+- Technical analysis for CLI-vs-browser booking split: `BOOKING_AUTOMATION_ANALYSIS.md`.
 
 ## Installation
 
@@ -19,6 +21,9 @@ pip install -r requirements.txt
 ## Configuration
 
 Primary configuration lives in `config.yaml`:
+
+> For Dublin 26/27 tracking, use `config.dublin.26-27.sample.yaml` as a starting template.
+
 
 ```yaml
 target:
@@ -86,12 +91,26 @@ python main.py discover --residences --city "London" --country "United Kingdom"
 ```bash
 python main.py scan --city "London" --country "United Kingdom"
 python main.py scan --city-id 12345 --notify
+python main.py scan --city "Dublin" --country "Ireland" --json
 ```
 
 ### Watch
 
 ```bash
 python main.py watch --city "London" --country "United Kingdom"
+```
+
+### Probe booking flow (CLI-first handover)
+
+```bash
+# Uses current config filters/matching; picks first candidate
+python main.py probe-booking --city "Dublin" --country "Ireland"
+
+# Narrow candidate and output machine-readable JSON (for agents)
+python main.py probe-booking \
+  --city "Dublin" --country "Ireland" \
+  --residence "Dominick" --room "Classic" --tenancy "41 Weeks" \
+  --json
 ```
 
 ### Test matching

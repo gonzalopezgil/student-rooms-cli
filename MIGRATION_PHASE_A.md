@@ -10,7 +10,7 @@ Phase A replaces the interactive console flow with a CLI-first, non-interactive 
 - `matching.py`: room filters and Semester 1 matching logic.
 - `models/config.py`: YAML/INI configuration models and loader.
 - `notifier.py`: Pushover sender + OpenClaw placeholder trigger.
-- `cli.py`: command dispatch (`discover`, `scan`, `watch`, `test-match`, `notify`).
+- `cli.py`: command dispatch (`discover`, `scan`, `watch`, `test-match`, `notify`, `probe-booking`).
 - `main.py`: CLI entrypoint.
 
 ## Configuration flow
@@ -26,6 +26,7 @@ Phase A replaces the interactive console flow with a CLI-first, non-interactive 
 - `watch`: poll periodically using `polling.interval_seconds` and `polling.jitter_seconds`.
 - `test-match`: quick check of Semester 1 matching rules.
 - `notify`: send a test notification to configured channels.
+- `probe-booking`: probe booking endpoints and return student-portal handover links for a matched option.
 
 ## Next steps (Phase B/C)
 

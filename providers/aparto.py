@@ -290,11 +290,36 @@ class StarRezScraper:
         self.session = session
 
     def _post_form(self, url: str, data: Dict[str, Any], timeout: int = 20) -> Optional[str]:
+        """Post form and follow any redirect.
+        
+        StarRez sometimes returns a quoted URL string as the response body
+        (AJAX-style redirect) instead of HTML. We detect and follow it.
+        """
         try:
             resp = self.session.post(url, data=data, headers=HEADERS, timeout=timeout)
-            if resp.status_code == 200:
-                return resp.text
-            logger.warning("StarRez POST %s → HTTP %s", url, resp.status_code)
+            if resp.status_code != 200:
+                logger.warning("StarRez POST %s → HTTP %s", url, resp.status_code)
+                return None
+
+            body = resp.text.strip()
+
+            # Check if response is a quoted redirect URL (e.g. "/StarRezPortalXEU/...")
+            if body.startswith('"') and body.endswith('"') and "/StarRez" in body:
+                redirect_path = body.strip('"')
+                if redirect_path.startswith("/StarRezPortalXEU"):
+                    redirect_url = f"https://portal.apartostudent.com{redirect_path}"
+                elif redirect_path.startswith("/"):
+                    redirect_url = f"{PORTAL_BASE}{redirect_path}"
+                else:
+                    redirect_url = f"{PORTAL_BASE}/{redirect_path}"
+                logger.info("StarRez redirect → %s", redirect_url)
+                follow_resp = self.session.get(redirect_url, headers=HEADERS, timeout=timeout)
+                if follow_resp.status_code == 200:
+                    return follow_resp.text
+                logger.warning("StarRez redirect follow → HTTP %s", follow_resp.status_code)
+                return None
+
+            return body
         except requests.RequestException as exc:
             logger.warning("StarRez POST error: %s", exc)
         return None
@@ -311,7 +336,11 @@ class StarRezScraper:
         return fields
 
     def _get_action_url(self, html: str, base_url: str) -> str:
-        """Extract form action URL from HTML."""
+        """Extract form action URL from HTML.
+        
+        StarRez form actions are typically relative to the portal root,
+        e.g. /F33813C2/65/... which maps to PORTAL_BASE + action.
+        """
         soup = BeautifulSoup(html, "html.parser")
         form = soup.find("form")
         if form:
@@ -319,7 +348,9 @@ class StarRezScraper:
             if action:
                 if action.startswith("http"):
                     return action
-                return f"{PORTAL_BASE}/{action.lstrip('/')}"
+                if action.startswith("/"):
+                    return f"{PORTAL_BASE}{action}"
+                return f"{PORTAL_BASE}/{action}"
         return base_url
 
     def check_semester1_availability(
@@ -344,11 +375,16 @@ class StarRezScraper:
         action_url = self._get_action_url(html, STARREZ_ENTRY_URL)
 
         # Step 2: Submit country selection (Ireland = 1)
-        fields["__eventTarget"] = ""
-        fields["__eventArgument"] = ""
-        # Try common country field names
-        for country_field in ["DropDownCountry", "ddlCountry", "country", "CountryID"]:
-            if country_field in fields or True:  # try regardless
+        # Detect the actual select field name from HTML
+        soup_fields = BeautifulSoup(html, "html.parser")
+        select_el = soup_fields.find("select")
+        country_field_name = select_el.get("name") if select_el else None
+
+        if country_field_name:
+            fields[country_field_name] = STARREZ_COUNTRY_VALUE
+        else:
+            # Fallback: try common field names
+            for country_field in ["CheckOrderList", "DropDownCountry", "ddlCountry", "country", "CountryID"]:
                 fields[country_field] = STARREZ_COUNTRY_VALUE
 
         time.sleep(1)

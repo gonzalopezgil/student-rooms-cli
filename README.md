@@ -9,7 +9,7 @@ Built for students hunting semester accommodation — especially when options ap
 | Provider | Website | Method | Coverage |
 |----------|---------|--------|----------|
 | **Yugo** | [yugo.com](https://yugo.com) | REST API | UK, Ireland, Spain, Portugal, Australia, and more |
-| **Aparto** | [apartostudent.com](https://apartostudent.com) | StarRez portal probing + site scraping | Dublin (IE) |
+| **Aparto** | [apartostudent.com](https://apartostudent.com) | StarRez portal probing + site scraping | Dublin (v1.0). Aparto operates in 14 cities (Dublin, Barcelona, Paris, Milan, Florence, Aberdeen, Brighton, Bristol, Cambridge, Glasgow, Kingston, Lancaster, Oxford, Reading) — more coming. |
 
 ## Installation
 

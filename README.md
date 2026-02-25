@@ -9,7 +9,7 @@ Built for students hunting semester accommodation — especially when options ap
 | Provider | Website | Method | Coverage |
 |----------|---------|--------|----------|
 | **Yugo** | [yugo.com](https://yugo.com) | REST API | UK, Ireland, Spain, Portugal, Australia, and more |
-| **Aparto** | [apartostudent.com](https://apartostudent.com) | StarRez portal probing + site scraping | Dublin (v1.0). Aparto operates in 14 cities (Dublin, Barcelona, Paris, Milan, Florence, Aberdeen, Brighton, Bristol, Cambridge, Glasgow, Kingston, Lancaster, Oxford, Reading) — more coming. |
+| **Aparto** | [apartostudent.com](https://apartostudent.com) | StarRez portal probing + site scraping | All 14 cities: Dublin, Barcelona, Paris, Milan, Florence, Aberdeen, Brighton, Bristol, Cambridge, Glasgow, Kingston, Lancaster, Oxford, Reading. Properties are discovered dynamically. |
 
 ## Installation
 
@@ -155,11 +155,17 @@ notifications:
 4. Supports full booking-flow probing (available beds, flat selection, portal redirect)
 
 ### Aparto Provider (StarRez)
-1. Establishes session via the EU StarRez portal
-2. Probes a range of **termIDs** via direct room search URLs
-3. Parses term names, date ranges, and room availability from response pages
-4. Detects Semester 1 by keyword matching + duration/date analysis
-5. Enriches results with pricing data scraped from property pages
+1. **Dynamically discovers** properties for the target city by scraping apartostudent.com
+2. Establishes session via the EU StarRez portal (auto-selects the correct country)
+3. Probes a range of **termIDs** via direct room search URLs on the appropriate regional portal
+4. Filters terms by matching property names against the target city's properties (supports abbreviations like PA→Pallars, CdM→Cristobal de Moura)
+5. Detects Semester 1 by keyword matching + duration/date analysis
+6. Enriches results with pricing data scraped from property pages
+
+**Portal topology:**
+- Ireland, Spain, Italy → shared IE portal (`apartostudent.starrezhousing.com`)
+- UK → separate UK portal (`apartostudentuk.starrezhousing.com`)
+- France → no StarRez portal (discover-only, no term scanning)
 
 ### Watch Mode
 - Scans all enabled providers at configurable intervals

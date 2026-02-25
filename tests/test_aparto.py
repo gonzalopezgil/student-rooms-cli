@@ -1,16 +1,28 @@
 """
 tests/test_aparto.py — Tests for the Aparto provider.
-Tests HTML parsing, price extraction, and provider interface.
+
+Tests dynamic property discovery, HTML parsing, price extraction,
+term matching, and the provider interface across multiple cities.
 """
 import unittest
 from unittest.mock import MagicMock, patch
 
 from student_rooms.providers.aparto import (
     ApartoProvider,
-    DUBLIN_PROPERTIES,
+    CITY_COUNTRY_MAP,
+    CITY_SLUG_MAP,
+    COUNTRY_PORTAL_MAP,
+    _build_property_aliases,
+    _discover_city_properties,
     _extract_next_data,
     _extract_prices_from_html,
+    _extract_property_name,
     _extract_rsc_json_chunks,
+    _is_semester1_term,
+    _is_target_city_term,
+    _normalise_name,
+    _parse_months_from_name,
+    _parse_weeks_from_name,
 )
 from student_rooms.providers.base import RoomOption
 
@@ -101,6 +113,38 @@ self.__next_f.push([1, "0:{\\"rooms\\":[{\\"name\\":\\"Bronze Ensuite\\",\\"pric
 </html>
 """
 
+SAMPLE_CITY_PAGE_HTML = """
+<!DOCTYPE html>
+<html>
+<head><title>Dublin Student Accommodation | aparto</title></head>
+<body>
+<div>
+  <a href="https://apartostudent.com/locations/dublin/binary-hub">Binary Hub</a>
+  <a href="https://apartostudent.com/locations/dublin/beckett-house">Beckett House</a>
+  <a href="https://apartostudent.com/locations/dublin/dorset-point">Dorset Point</a>
+  <a href="https://apartostudent.com/locations/dublin/the-loom">The Loom</a>
+  <a href="https://apartostudent.com/locations/dublin/montrose">Montrose</a>
+  <a href="https://apartostudent.com/locations/dublin/stephens-quarter">Stephen's Quarter</a>
+</div>
+</body>
+</html>
+"""
+
+SAMPLE_BARCELONA_PAGE_HTML = """
+<!DOCTYPE html>
+<html>
+<head><title>Barcelona Student Accommodation | aparto</title></head>
+<body>
+<div>
+  <a href="https://apartostudent.com/locations/barcelona/pallars">Pallars</a>
+  <a href="https://apartostudent.com/locations/barcelona/pallars/short-stays">Short stays</a>
+  <a href="https://apartostudent.com/locations/barcelona/cristobal-de-moura">Cristóbal de Moura</a>
+  <a href="https://apartostudent.com/locations/barcelona/diagonal-suites">Diagonal Suites</a>
+</div>
+</body>
+</html>
+"""
+
 
 class TestExtractPricesFromHtml(unittest.TestCase):
     """Test HTML price/room extraction."""
@@ -163,49 +207,195 @@ class TestExtractRscJsonChunks(unittest.TestCase):
         self.assertTrue(len(chunks) >= 0)
 
 
-class TestDublinProperties(unittest.TestCase):
-    """Test the static properties list."""
+class TestCityCountryMappings(unittest.TestCase):
+    """Test the city/country/portal configuration maps."""
 
-    def test_has_six_properties(self):
-        self.assertEqual(len(DUBLIN_PROPERTIES), 6)
+    def test_all_14_cities_mapped(self):
+        """All 14 Aparto cities should be in the CITY_COUNTRY_MAP."""
+        expected_cities = {
+            "Dublin", "Barcelona", "Milan", "Florence", "Paris",
+            "Aberdeen", "Brighton", "Bristol", "Cambridge", "Glasgow",
+            "Kingston", "Lancaster", "Oxford", "Reading",
+        }
+        # Kingston-London is an alias for Kingston
+        mapped_cities = set(CITY_COUNTRY_MAP.keys()) - {"Kingston-London"}
+        self.assertEqual(mapped_cities, expected_cities)
 
-    def test_all_have_required_keys(self):
-        for prop in DUBLIN_PROPERTIES:
-            self.assertIn("slug", prop)
-            self.assertIn("name", prop)
-            self.assertIn("location", prop)
+    def test_all_cities_have_slugs(self):
+        for city in CITY_COUNTRY_MAP:
+            self.assertIn(city, CITY_SLUG_MAP, f"Missing slug for {city}")
 
-    def test_known_slugs(self):
-        slugs = [p["slug"] for p in DUBLIN_PROPERTIES]
+    def test_all_countries_have_portal_config(self):
+        countries_used = set(CITY_COUNTRY_MAP.values())
+        for country in countries_used:
+            self.assertIn(country, COUNTRY_PORTAL_MAP, f"Missing portal config for {country}")
+
+    def test_ie_es_it_share_portal(self):
+        """Ireland, Spain, Italy should share the same StarRez portal."""
+        ie_base = COUNTRY_PORTAL_MAP["Ireland"]["portal_base"]
+        es_base = COUNTRY_PORTAL_MAP["Spain"]["portal_base"]
+        it_base = COUNTRY_PORTAL_MAP["Italy"]["portal_base"]
+        self.assertEqual(ie_base, es_base)
+        self.assertEqual(es_base, it_base)
+
+    def test_uk_has_separate_portal(self):
+        uk_base = COUNTRY_PORTAL_MAP["UK"]["portal_base"]
+        ie_base = COUNTRY_PORTAL_MAP["Ireland"]["portal_base"]
+        self.assertNotEqual(uk_base, ie_base)
+        self.assertIsNotNone(uk_base)
+
+    def test_france_has_no_portal(self):
+        self.assertIsNone(COUNTRY_PORTAL_MAP["France"]["portal_base"])
+
+
+class TestDynamicPropertyDiscovery(unittest.TestCase):
+    """Test scraping city pages for property discovery."""
+
+    @patch("student_rooms.providers.aparto._fetch")
+    def test_discover_dublin_properties(self, mock_fetch):
+        mock_fetch.return_value = SAMPLE_CITY_PAGE_HTML
+        import requests
+        props = _discover_city_properties(requests.Session(), "dublin")
+        slugs = {p["slug"] for p in props}
         self.assertIn("binary-hub", slugs)
         self.assertIn("beckett-house", slugs)
         self.assertIn("dorset-point", slugs)
-        self.assertIn("montrose", slugs)
         self.assertIn("the-loom", slugs)
+        self.assertIn("montrose", slugs)
         self.assertIn("stephens-quarter", slugs)
+        self.assertEqual(len(props), 6)
+
+    @patch("student_rooms.providers.aparto._fetch")
+    def test_discover_barcelona_properties(self, mock_fetch):
+        mock_fetch.return_value = SAMPLE_BARCELONA_PAGE_HTML
+        import requests
+        props = _discover_city_properties(requests.Session(), "barcelona")
+        slugs = {p["slug"] for p in props}
+        self.assertIn("pallars", slugs)
+        self.assertIn("cristobal-de-moura", slugs)
+        self.assertIn("diagonal-suites", slugs)
+        # short-stays should be filtered out
+        self.assertNotIn("short-stays", slugs)
+        self.assertEqual(len(props), 3)
+
+    @patch("student_rooms.providers.aparto._fetch")
+    def test_discover_returns_empty_on_failure(self, mock_fetch):
+        mock_fetch.return_value = None
+        import requests
+        props = _discover_city_properties(requests.Session(), "nonexistent")
+        self.assertEqual(props, [])
+
+
+class TestPropertyAliases(unittest.TestCase):
+    """Test property alias/abbreviation mapping."""
+
+    def test_builds_aliases(self):
+        props = [
+            {"name": "Cristobal De Moura", "slug": "cristobal-de-moura"},
+            {"name": "Pallars", "slug": "pallars"},
+        ]
+        aliases = _build_property_aliases(props)
+        # Should include normalised names
+        self.assertIn("cristobal de moura", aliases)
+        self.assertIn("pallars", aliases)
+        # Should include initials
+        self.assertIn("cdm", aliases)
+
+    def test_alias_maps_to_canonical_name(self):
+        props = [{"name": "Cristobal De Moura", "slug": "cristobal-de-moura"}]
+        aliases = _build_property_aliases(props)
+        self.assertEqual(aliases.get("cdm"), "Cristobal De Moura")
+
+
+class TestIsTargetCityTerm(unittest.TestCase):
+    """Test term-to-city matching."""
+
+    def _dublin_context(self):
+        names = {"Binary Hub", "Beckett House", "Dorset Point", "Montrose", "The Loom", "Stephens Quarter"}
+        aliases = _build_property_aliases([{"name": n, "slug": ""} for n in names])
+        return names, aliases
+
+    def _barcelona_context(self):
+        names = {"Pallars", "Cristobal De Moura", "Diagonal Suites"}
+        aliases = _build_property_aliases([{"name": n, "slug": ""} for n in names])
+        return names, aliases
+
+    def test_dublin_term_matches_dublin(self):
+        names, aliases = self._dublin_context()
+        self.assertTrue(_is_target_city_term("Binary Hub - 26/27 - 41 Weeks", names, aliases))
+        self.assertTrue(_is_target_city_term("The Loom - 26/27 - Semester 1", names, aliases))
+        self.assertTrue(_is_target_city_term("Dorset Point - 26/27 - 41 Weeks", names, aliases))
+
+    def test_dublin_term_does_not_match_barcelona(self):
+        names, aliases = self._barcelona_context()
+        self.assertFalse(_is_target_city_term("Binary Hub - 26/27 - 41 Weeks", names, aliases))
+        self.assertFalse(_is_target_city_term("The Loom - 26/27 - Semester 1", names, aliases))
+
+    def test_barcelona_term_matches_barcelona(self):
+        names, aliases = self._barcelona_context()
+        self.assertTrue(_is_target_city_term("Pallars - 26/27 - 12 months", names, aliases))
+        self.assertTrue(_is_target_city_term("Cristobal de Moura - 26/27 - 9 months", names, aliases))
+
+    def test_barcelona_abbreviation_matches(self):
+        names, aliases = self._barcelona_context()
+        # "PA" should match Pallars, "CdM" should match Cristobal de Moura
+        self.assertTrue(_is_target_city_term("PA - 26/27 - Semester 2 Discount", names, aliases))
+        self.assertTrue(_is_target_city_term("CdM - 26/27 - TEST", names, aliases))
+
+    def test_milan_term_does_not_match_dublin(self):
+        names, aliases = self._dublin_context()
+        self.assertFalse(_is_target_city_term("Giovenale - 26/27 - 10 months", names, aliases))
+        self.assertFalse(_is_target_city_term("Ripamonti - 26/27 - 12 months", names, aliases))
 
 
 class TestApartoProvider(unittest.TestCase):
     """Test ApartoProvider methods."""
 
     def test_provider_name(self):
-        provider = ApartoProvider()
+        provider = ApartoProvider(city="Dublin")
         self.assertEqual(provider.name, "aparto")
 
-    def test_discover_returns_all_properties(self):
-        provider = ApartoProvider()
+    def test_city_country_resolution(self):
+        p = ApartoProvider(city="Dublin")
+        self.assertEqual(p._country, "Ireland")
+        self.assertEqual(p._city_slug, "dublin")
+
+        p = ApartoProvider(city="Barcelona")
+        self.assertEqual(p._country, "Spain")
+        self.assertEqual(p._city_slug, "barcelona")
+
+        p = ApartoProvider(city="Milan")
+        self.assertEqual(p._country, "Italy")
+
+        p = ApartoProvider(city="Brighton")
+        self.assertEqual(p._country, "UK")
+
+        p = ApartoProvider(city="Paris")
+        self.assertEqual(p._country, "France")
+
+    def test_country_override(self):
+        p = ApartoProvider(city="Dublin", country="UK")
+        self.assertEqual(p._country, "UK")
+
+    @patch("student_rooms.providers.aparto._discover_city_properties")
+    def test_discover_returns_dynamic_properties(self, mock_discover):
+        mock_discover.return_value = [
+            {"slug": "pallars", "name": "Pallars", "location": "Barcelona", "url": "https://apartostudent.com/locations/barcelona/pallars"},
+            {"slug": "cristobal-de-moura", "name": "Cristobal De Moura", "location": "Barcelona", "url": "https://apartostudent.com/locations/barcelona/cristobal-de-moura"},
+        ]
+        provider = ApartoProvider(city="Barcelona")
         props = provider.discover_properties()
-        self.assertEqual(len(props), 6)
+        self.assertEqual(len(props), 2)
         for prop in props:
             self.assertEqual(prop["provider"], "aparto")
-            self.assertIn("url", prop)
-            self.assertTrue(prop["url"].startswith("https://apartostudent.com"))
+            self.assertEqual(prop["city"], "Barcelona")
+            self.assertEqual(prop["country"], "Spain")
 
     @patch("student_rooms.providers.aparto._fetch")
     def test_scrape_property_with_html(self, mock_fetch):
         mock_fetch.return_value = SAMPLE_PROPERTY_HTML
-        provider = ApartoProvider()
-        rooms = provider._scrape_property({"slug": "binary-hub", "name": "Binary Hub", "location": "Dublin 8"})
+        provider = ApartoProvider(city="Dublin")
+        rooms = provider._scrape_property({"slug": "binary-hub", "name": "Binary Hub", "location": "Dublin 8", "url": "https://apartostudent.com/locations/dublin/binary-hub"})
         self.assertEqual(len(rooms), 4)
         self.assertEqual(rooms[0]["property_name"], "Binary Hub")
         self.assertEqual(rooms[0]["property_slug"], "binary-hub")
@@ -213,8 +403,8 @@ class TestApartoProvider(unittest.TestCase):
     @patch("student_rooms.providers.aparto._fetch")
     def test_scrape_property_returns_empty_on_failure(self, mock_fetch):
         mock_fetch.return_value = None
-        provider = ApartoProvider()
-        rooms = provider._scrape_property({"slug": "fake", "name": "Fake", "location": ""})
+        provider = ApartoProvider(city="Dublin")
+        rooms = provider._scrape_property({"slug": "fake", "name": "Fake", "location": "", "url": "https://apartostudent.com/locations/dublin/fake"})
         self.assertEqual(rooms, [])
 
 
@@ -264,12 +454,16 @@ class TestRoomOption(unittest.TestCase):
 
 
 class TestApartoScanMocked(unittest.TestCase):
-    """Test ApartoProvider.scan with mocked StarRez scraper."""
+    """Test ApartoProvider.scan with mocked StarRez scraper + discovery."""
 
+    @patch("student_rooms.providers.aparto._discover_city_properties")
     @patch("student_rooms.providers.aparto._fetch")
-    def test_scan_returns_room_options_no_semester1(self, mock_fetch):
+    def test_scan_returns_room_options_no_semester1(self, mock_fetch, mock_discover):
+        mock_discover.return_value = [
+            {"slug": "binary-hub", "name": "Binary Hub", "location": "Dublin 8", "url": "https://apartostudent.com/locations/dublin/binary-hub"},
+        ]
         mock_fetch.return_value = SAMPLE_PROPERTY_HTML
-        provider = ApartoProvider()
+        provider = ApartoProvider(city="Dublin")
 
         from student_rooms.providers.aparto import StarRezScraper, StarRezTerm
         full_year_term = StarRezTerm(
@@ -281,7 +475,7 @@ class TestApartoScanMocked(unittest.TestCase):
             start_iso="2026-08-29",
             end_iso="2027-06-12",
             weeks=41,
-            is_dublin=True,
+            is_target_city=True,
             is_semester1=False,
             has_rooms=True,
             booking_url="https://test.com/term/1267",
@@ -291,10 +485,14 @@ class TestApartoScanMocked(unittest.TestCase):
 
         self.assertEqual(len(results), 0)
 
+    @patch("student_rooms.providers.aparto._discover_city_properties")
     @patch("student_rooms.providers.aparto._fetch")
-    def test_scan_returns_all_when_semester1_available(self, mock_fetch):
+    def test_scan_returns_all_when_semester1_available(self, mock_fetch, mock_discover):
+        mock_discover.return_value = [
+            {"slug": "binary-hub", "name": "Binary Hub", "location": "Dublin 8", "url": "https://apartostudent.com/locations/dublin/binary-hub"},
+        ]
         mock_fetch.return_value = SAMPLE_PROPERTY_HTML
-        provider = ApartoProvider()
+        provider = ApartoProvider(city="Dublin")
 
         from student_rooms.providers.aparto import StarRezScraper, StarRezTerm
         sem1_term = StarRezTerm(
@@ -306,7 +504,7 @@ class TestApartoScanMocked(unittest.TestCase):
             start_iso="2026-08-29",
             end_iso="2027-01-31",
             weeks=22,
-            is_dublin=True,
+            is_target_city=True,
             is_semester1=True,
             has_rooms=True,
             booking_url="https://test.com/term/9999",
@@ -323,42 +521,88 @@ class TestApartoScanMocked(unittest.TestCase):
             self.assertTrue(r.available)
             self.assertIn("Semester 1", r.option_name)
 
+    @patch("student_rooms.providers.aparto._discover_city_properties")
+    @patch("student_rooms.providers.aparto._fetch")
+    def test_scan_barcelona(self, mock_fetch, mock_discover):
+        """Test scanning Barcelona with mocked data."""
+        mock_discover.return_value = [
+            {"slug": "pallars", "name": "Pallars", "location": "Barcelona", "url": "https://apartostudent.com/locations/barcelona/pallars"},
+        ]
+        mock_fetch.return_value = '<html><body><p>Room €959 per month</p></body></html>'
+        provider = ApartoProvider(city="Barcelona")
+
+        from student_rooms.providers.aparto import StarRezScraper, StarRezTerm
+        bcn_term = StarRezTerm(
+            term_id=1367,
+            term_name="Pallars - 26/27 - Semester 1",
+            property_name="Pallars",
+            start_date="01/09/2026",
+            end_date="31/01/2027",
+            start_iso="2026-09-01",
+            end_iso="2027-01-31",
+            weeks=22,
+            is_target_city=True,
+            is_semester1=True,
+            has_rooms=True,
+            booking_url="https://test.com/term/1367",
+        )
+        with patch.object(StarRezScraper, "scan_term_range", return_value=[bcn_term]):
+            results = provider.scan(academic_year="2026-27", semester=1, apply_semester_filter=True)
+
+        self.assertTrue(len(results) >= 1)
+        for r in results:
+            self.assertEqual(r.provider, "aparto")
+            self.assertEqual(r.property_name, "Pallars")
+            self.assertIn("city", r.raw)
+            self.assertEqual(r.raw["city"], "Barcelona")
+            self.assertEqual(r.raw["country"], "Spain")
+
+    @patch("student_rooms.providers.aparto._discover_city_properties")
+    def test_scan_france_returns_empty(self, mock_discover):
+        """France has no StarRez portal, scan should return empty."""
+        mock_discover.return_value = [
+            {"slug": "paris-liberte", "name": "Paris Liberte", "location": "Paris", "url": "https://apartostudent.com/locations/paris/paris-liberte"},
+        ]
+        provider = ApartoProvider(city="Paris")
+        results = provider.scan(academic_year="2026-27")
+        self.assertEqual(results, [])
+
 
 class TestStarRezTermAnalysis(unittest.TestCase):
     """Test StarRez term detection and analysis."""
 
     def test_is_semester1_by_keyword(self):
-        from student_rooms.providers.aparto import _is_semester1_term
         self.assertTrue(_is_semester1_term("Semester 1 26/27", "29/08/2026", "31/01/2027", 22))
         self.assertTrue(_is_semester1_term("Sem 1", None, None, None))
         self.assertFalse(_is_semester1_term("Full Year 41 Weeks", "29/08/2026", "12/06/2027", 41))
 
     def test_is_semester1_by_duration(self):
-        from student_rooms.providers.aparto import _is_semester1_term
         self.assertTrue(_is_semester1_term("Special 22 Weeks", "29/08/2026", "31/01/2027", 22))
         self.assertFalse(_is_semester1_term("Special 22 Weeks", "01/02/2027", "30/06/2027", 22))
 
     def test_is_semester1_by_iso_dates(self):
-        from student_rooms.providers.aparto import _is_semester1_term
         self.assertTrue(_is_semester1_term("Short Stay", "2026-09-01", "2027-01-31", None))
         self.assertFalse(_is_semester1_term("Full Year", "2026-08-29", "2027-06-12", None))
 
-    def test_is_dublin_term(self):
-        from student_rooms.providers.aparto import _is_dublin_term
-        self.assertTrue(_is_dublin_term("Binary Hub - 26/27 - 41 Weeks"))
-        self.assertTrue(_is_dublin_term("The Loom - 26/27 - Semester 1"))
-        self.assertFalse(_is_dublin_term("Giovenale - 26/27 - 10 months"))
-
     def test_extract_property_name(self):
-        from student_rooms.providers.aparto import _extract_property_name
         self.assertEqual(_extract_property_name("Binary Hub - 26/27 - 41 Weeks"), "Binary Hub")
         self.assertEqual(_extract_property_name("Montrose - 26/27 - 41 weeks"), "Montrose")
+        self.assertEqual(_extract_property_name("Pallars - 26/27 - 12 months"), "Pallars")
+        self.assertEqual(_extract_property_name("Cristobal de Moura - 26/27 - 9 months"), "Cristobal de Moura")
+        # No-space variations
+        self.assertEqual(_extract_property_name("Cristobal de Moura -26/27-Semester 1-10%"), "Cristobal de Moura")
+        self.assertEqual(_extract_property_name("PA - 26/27 - Generic Group"), "PA")
+        self.assertEqual(_extract_property_name("aparto Cristobal de Moura-September 2024"), "Cristobal de Moura")
 
     def test_parse_weeks(self):
-        from student_rooms.providers.aparto import _parse_weeks_from_name
         self.assertEqual(_parse_weeks_from_name("Binary Hub - 26/27 - 41 Weeks"), 41)
         self.assertEqual(_parse_weeks_from_name("The Loom - 25/26 - 10 Week Summer"), 10)
         self.assertIsNone(_parse_weeks_from_name("Giovenale - 26/27 - 10 months"))
+
+    def test_parse_months(self):
+        self.assertEqual(_parse_months_from_name("Pallars - 26/27 - 12 months"), 12)
+        self.assertEqual(_parse_months_from_name("Ripamonti - 26/27 - 10 months"), 10)
+        self.assertIsNone(_parse_months_from_name("Binary Hub - 26/27 - 41 Weeks"))
 
 
 if __name__ == "__main__":

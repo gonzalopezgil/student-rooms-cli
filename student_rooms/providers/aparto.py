@@ -1,15 +1,20 @@
 """
 providers/aparto.py — Aparto accommodation provider (apartostudent.com).
 
-Scraping strategy (StarRez termID probing):
-  1. Navigate EU portal → select Ireland → get session cookies
-  2. Probe a range of termIDs via direct room search URLs
-  3. Each valid termID returns a "Choose your room" page with:
-     - Term name (e.g. "Binary Hub - 26/27 - 41 Weeks")
-     - Date range (start/end dates)
-     - Room availability data
-  4. Detect Semester 1 by analyzing term names and date ranges
-  5. Cache known termIDs to detect NEW ones between scans
+Dynamically supports all 14 cities where Aparto operates.
+
+Scraping strategy:
+  1. Discover properties for the target city by scraping apartostudent.com
+  2. Establish StarRez portal session (country-specific routing)
+  3. Probe a range of termIDs via direct room search URLs
+  4. Filter terms by matching property names against the target city
+  5. Enrich with pricing data from property pages
+
+StarRez portal topology:
+  - EU entry portal → portal.apartostudent.com/StarRezPortalXEU (country selection)
+  - IE/ES/IT terms → apartostudent.starrezhousing.com/StarRezPortal (single pool)
+  - UK terms → apartostudentuk.starrezhousing.com/StarRezPortal (separate pool)
+  - France → no StarRez portal (discover-only)
 """
 from __future__ import annotations
 
@@ -33,42 +38,74 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 MAIN_BASE = "https://apartostudent.com"
+
+# EU portal: entry point for country selection (shared by all countries)
 PORTAL_EU_BASE = "https://portal.apartostudent.com/StarRezPortalXEU"
-PORTAL_IE_BASE = "https://apartostudent.starrezhousing.com/StarRezPortal"
-
-# Dublin properties: slug → display name + location
-DUBLIN_PROPERTIES: List[Dict[str, str]] = [
-    {"slug": "binary-hub",       "name": "Binary Hub",         "location": "Bonham St, Dublin 8"},
-    {"slug": "beckett-house",    "name": "Beckett House",      "location": "Pearse St, Dublin 2"},
-    {"slug": "dorset-point",     "name": "Dorset Point",       "location": "Dorset St, Dublin 1"},
-    {"slug": "montrose",         "name": "Montrose",           "location": "Stillorgan Rd (near UCD)"},
-    {"slug": "the-loom",         "name": "The Loom",           "location": "Mill St, Dublin 8"},
-    {"slug": "stephens-quarter", "name": "Stephen's Quarter",  "location": "Earlsfort Tce, Dublin 2"},
-]
-
-# Dublin property names for matching (lowercase)
-DUBLIN_PROPERTY_NAMES = {p["name"].lower() for p in DUBLIN_PROPERTIES}
-
-# Known termIDs for Dublin properties (26/27, full year)
-KNOWN_DUBLIN_TERM_IDS = {
-    1264: "Dorset Point - 26/27 - 41 Weeks",
-    1265: "Beckett House - 26/27 - 41 Weeks",
-    1266: "The Loom - 26/27 - 41 weeks",
-    1267: "Binary Hub - 26/27 - 41 Weeks",
-    1268: "Montrose - 26/27 - 41 weeks",
-}
-
-# TermID scan range for detecting new terms
-# Current known range: 1258-1284 (Feb 2026)
-# Scan wider to catch new additions
-TERM_ID_SCAN_START = 1250
-TERM_ID_SCAN_END = 1350
-
-# StarRez Ireland booking entry point
 STARREZ_ENTRY_URL = (
     f"{PORTAL_EU_BASE}/F33813C2/65/1556/"
     "Book_a_room-Choose_Your_Country?UrlToken=8E2FC74D"
 )
+
+# StarRez portals for term probing (by region)
+PORTAL_IE_BASE = "https://apartostudent.starrezhousing.com/StarRezPortal"
+PORTAL_UK_BASE = "https://apartostudentuk.starrezhousing.com/StarRezPortal"
+
+# Country → StarRez portal mapping
+# IE/ES/IT all share the IE portal; UK has its own; FR has none
+COUNTRY_PORTAL_MAP: Dict[str, Dict[str, Any]] = {
+    "Ireland":  {"portal_base": PORTAL_IE_BASE, "country_id": "1"},
+    "Spain":    {"portal_base": PORTAL_IE_BASE, "country_id": "4"},
+    "Italy":    {"portal_base": PORTAL_IE_BASE, "country_id": "0"},
+    "UK":       {"portal_base": PORTAL_UK_BASE, "country_id": "3"},
+    "France":   {"portal_base": None,           "country_id": None},
+}
+
+# City → country mapping (all 14 cities)
+CITY_COUNTRY_MAP: Dict[str, str] = {
+    "Dublin":          "Ireland",
+    "Barcelona":       "Spain",
+    "Milan":           "Italy",
+    "Florence":        "Italy",
+    "Paris":           "France",
+    "Aberdeen":        "UK",
+    "Brighton":        "UK",
+    "Bristol":         "UK",
+    "Cambridge":       "UK",
+    "Glasgow":         "UK",
+    "Kingston":        "UK",
+    "Kingston-London": "UK",
+    "Lancaster":       "UK",
+    "Oxford":          "UK",
+    "Reading":         "UK",
+}
+
+# City → URL slug on apartostudent.com/locations/
+CITY_SLUG_MAP: Dict[str, str] = {
+    "Dublin":          "dublin",
+    "Barcelona":       "barcelona",
+    "Milan":           "milan",
+    "Florence":        "florence",
+    "Paris":           "paris",
+    "Aberdeen":        "aberdeen",
+    "Brighton":        "brighton",
+    "Bristol":         "bristol",
+    "Cambridge":       "cambridge",
+    "Glasgow":         "glasgow",
+    "Kingston":        "kingston-london",
+    "Kingston-London": "kingston-london",
+    "Lancaster":       "lancaster",
+    "Oxford":          "oxford",
+    "Reading":         "reading",
+}
+
+# Default scan range for termID probing
+# IE portal: terms range from ~100 to ~1500+ (as of Feb 2026).
+# For efficiency, the default range targets the recent 400 IDs where
+# current-year terms cluster.  A full historical scan can be done by
+# explicitly passing start_id=100.
+DEFAULT_TERM_SCAN_START = 1200
+DEFAULT_TERM_SCAN_END = 1600
+DEFAULT_TERM_SCAN_MAX_CONSECUTIVE_MISSES = 50
 
 HEADERS = {
     "User-Agent": (
@@ -100,7 +137,7 @@ class StarRezTerm:
     start_iso: Optional[str]   # YYYY-MM-DD from data attributes
     end_iso: Optional[str]
     weeks: Optional[int]
-    is_dublin: bool
+    is_target_city: bool
     is_semester1: bool
     has_rooms: bool
     booking_url: str
@@ -185,7 +222,7 @@ def _extract_prices_from_html(html: str, property_name: str) -> List[Dict[str, A
 
     proximity_pattern = re.compile(
         r'(Bronze|Silver|Gold|Platinum|Studio|Deluxe)[\s\-]*(Ensuite|En-suite|Studio|Room|Suite|Apartment)?'
-        r'.{0,200}?€\s*(\d+(?:[.,]\d+)?)\s*(?:p/?w|/week|per week|pw)',
+        r'.{0,200}?[€£]\s*(\d+(?:[.,]\d+)?)\s*(?:p/?w|/week|per week|pw)',
         re.IGNORECASE | re.DOTALL,
     )
     for m in proximity_pattern.finditer(text):
@@ -210,6 +247,21 @@ def _extract_prices_from_html(html: str, property_name: str) -> List[Dict[str, A
         rooms.sort(key=lambda r: tier_order.get(r["room_type"].split()[0].title(), 99))
         return rooms
 
+    # Fallback: check for monthly pricing (common for ES/IT)
+    monthly_pattern = re.compile(
+        r'[€£]\s*(\d+(?:[.,]\d+)?)\s*(?:per month|/month|p/?m|pcm)',
+        re.IGNORECASE,
+    )
+    monthly_prices = monthly_pattern.findall(text)
+    if monthly_prices:
+        prices = sorted({float(p.replace(",", ".")) for p in monthly_prices if p})
+        if prices:
+            return [{
+                "room_type": "Room",
+                "price_label": f"from €{prices[0]:.0f}/month",
+                "price_weekly": round(prices[0] / 4.33, 2),  # approximate
+            }]
+
     # Fallback: separate tier list + price list
     tier_pattern = re.compile(
         r'\b(Bronze|Silver|Gold|Platinum|Studio|Deluxe)\b'
@@ -224,7 +276,7 @@ def _extract_prices_from_html(html: str, property_name: str) -> List[Dict[str, A
         if label not in found_tiers:
             found_tiers.append(label)
 
-    price_pattern = re.compile(r'€\s*(\d+(?:[.,]\d+)?)\s*(?:p/?w|/week|per week|pw)', re.IGNORECASE)
+    price_pattern = re.compile(r'[€£]\s*(\d+(?:[.,]\d+)?)\s*(?:p/?w|/week|per week|pw)', re.IGNORECASE)
     prices_raw = price_pattern.findall(text)
     prices = sorted({float(p.replace(",", ".")) for p in prices_raw if p})
 
@@ -266,7 +318,7 @@ def _extract_rooms_from_next_data(next_data: Dict[str, Any]) -> List[Dict[str, A
                 ):
                     weekly = None
                     try:
-                        weekly = float(str(price).replace("€", "").replace(",", "").strip())
+                        weekly = float(str(price).replace("€", "").replace("£", "").replace(",", "").strip())
                     except ValueError:
                         pass
                     rooms.append({
@@ -286,6 +338,108 @@ def _extract_rooms_from_next_data(next_data: Dict[str, Any]) -> List[Dict[str, A
 
 
 # ---------------------------------------------------------------------------
+# Dynamic property discovery
+# ---------------------------------------------------------------------------
+
+def _discover_city_properties(
+    session: requests.Session,
+    city_slug: str,
+) -> List[Dict[str, str]]:
+    """
+    Scrape apartostudent.com/locations/{city_slug} to discover properties.
+
+    Returns a list of dicts with keys: slug, name, location, url.
+    """
+    url = f"{MAIN_BASE}/locations/{city_slug}"
+    html = _fetch(session, url)
+    if not html:
+        logger.warning("Could not fetch city page: %s", url)
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    properties: List[Dict[str, str]] = []
+    seen_slugs: Set[str] = set()
+
+    # Find all links to /locations/{city_slug}/{property_slug}
+    pattern = re.compile(rf'^{re.escape(MAIN_BASE)}/locations/{re.escape(city_slug)}/([a-z0-9-]+)/?$')
+    for link in soup.find_all("a", href=True):
+        href = link.get("href", "")
+        if not href.startswith("http"):
+            href = MAIN_BASE + href
+        m = pattern.match(href.rstrip("/"))
+        if not m:
+            continue
+        slug = m.group(1)
+        if slug in seen_slugs or slug == "short-stays":
+            continue
+        seen_slugs.add(slug)
+
+        # Derive display name from slug
+        name = slug.replace("-", " ").title()
+
+        # Try to get address text near the link
+        parent = link.find_parent(["div", "section", "article"])
+        location = ""
+        if parent:
+            addr_text = parent.get_text(separator=" ").strip()
+            # Look for address patterns (street names, postcodes)
+            addr_match = re.search(
+                r'((?:Carrer|Calle|Via|Rue|Street|St|Rd|Road|Square|Place|Point|Tce|Terrace)\s+[^,\n]{3,50}(?:,\s*[^,\n]{3,30})?)',
+                addr_text,
+                re.IGNORECASE,
+            )
+            if addr_match:
+                location = addr_match.group(1).strip()
+
+        properties.append({
+            "slug": slug,
+            "name": name,
+            "location": location,
+            "url": f"{MAIN_BASE}/locations/{city_slug}/{slug}",
+        })
+
+    if not properties:
+        logger.warning("No properties found for city slug: %s", city_slug)
+
+    return properties
+
+
+def _normalise_name(name: str) -> str:
+    """Normalise a property name for fuzzy matching."""
+    return re.sub(r'[^a-z0-9\s]', '', name.lower()).strip()
+
+
+def _build_property_aliases(properties: List[Dict[str, str]]) -> Dict[str, str]:
+    """
+    Build a mapping of common abbreviations/aliases → canonical property name.
+
+    This handles StarRez term names that use abbreviations:
+      "PA" → "Pallars"
+      "CdM" → "Cristobal de Moura"
+      "Rifredi" → "Rifredi"
+    """
+    aliases: Dict[str, str] = {}
+    for prop in properties:
+        name = prop["name"]
+        norm = _normalise_name(name)
+        aliases[norm] = name
+
+        # Generate common abbreviations
+        # e.g. "Cristobal De Moura" → "cdm"
+        words = name.split()
+        if len(words) >= 2:
+            initials = "".join(w[0].lower() for w in words if w[0].isupper() or len(w) > 2)
+            if len(initials) >= 2:
+                aliases[initials] = name
+
+        # Also map just the first word (e.g. "Pallars" from "Pallars Barcelona")
+        if words:
+            aliases[words[0].lower()] = name
+
+    return aliases
+
+
+# ---------------------------------------------------------------------------
 # Term analysis
 # ---------------------------------------------------------------------------
 
@@ -295,17 +449,67 @@ def _parse_weeks_from_name(term_name: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
+def _parse_months_from_name(term_name: str) -> Optional[int]:
+    """Extract month count from term name like 'Pallars - 26/27 - 12 months'."""
+    m = re.search(r'(\d+)\s*[Mm]onth', term_name)
+    return int(m.group(1)) if m else None
+
+
 def _extract_property_name(term_name: str) -> str:
-    """Extract property name from term name like 'Binary Hub - 26/27 - 41 Weeks'."""
+    """Extract property name from term name like 'Binary Hub - 26/27 - 41 Weeks'.
+
+    Handles variations:
+      - "Binary Hub - 26/27 - 41 Weeks"
+      - "Cristobal de Moura -26/27-Semester 1-10%"  (missing space)
+      - "aparto Cristobal de Moura-September 2024"
+      - "PA - 26/27 - Generic Group"
+    """
+    # Standard format: "Name - YY/YY - ..."
     if " - " in term_name:
         return term_name.split(" - ")[0].strip()
+    # Handle "Name -YY/YY-..." (no space before dash + year pattern)
+    m = re.match(r'^(.+?)\s*-\s*\d{2}/\d{2}', term_name)
+    if m:
+        return m.group(1).strip()
+    # Handle "aparto Name-Something"
+    if term_name.lower().startswith("aparto "):
+        remainder = term_name[7:]
+        if "-" in remainder:
+            return remainder.split("-")[0].strip()
+        return remainder.strip()
     return term_name
 
 
-def _is_dublin_term(term_name: str) -> bool:
-    """Check if a term belongs to a Dublin property."""
-    prop_name = _extract_property_name(term_name).lower()
-    return any(dp in prop_name or prop_name in dp for dp in DUBLIN_PROPERTY_NAMES)
+def _is_target_city_term(
+    term_name: str,
+    target_property_names: Set[str],
+    property_aliases: Dict[str, str],
+) -> bool:
+    """
+    Check if a term belongs to a property in the target city.
+
+    Uses fuzzy matching against dynamically discovered property names
+    and their aliases/abbreviations.
+    """
+    prop_name_raw = _extract_property_name(term_name)
+    prop_name_norm = _normalise_name(prop_name_raw)
+
+    # Direct match against known property names
+    for known_name in target_property_names:
+        known_norm = _normalise_name(known_name)
+        if known_norm in prop_name_norm or prop_name_norm in known_norm:
+            return True
+
+    # Check aliases (handles abbreviations like PA, CdM)
+    for alias, canonical in property_aliases.items():
+        if alias == prop_name_norm or prop_name_norm.startswith(alias + " "):
+            return True
+        # Also check if the alias appears at the start of the term name
+        term_start = _normalise_name(term_name.split("-")[0].strip() if "-" in term_name else term_name)
+        if alias == term_start:
+            return True
+
+    return False
 
 
 def _is_semester1_term(
@@ -364,18 +568,23 @@ class StarRezScraper:
     """
     Navigate the StarRez Aparto portal and probe termIDs.
 
-    Strategy:
-    1. Establish session by navigating EU portal → Ireland
-    2. Probe termIDs by directly accessing room search redirect URLs
-    3. Parse term info from each valid response page
+    Supports all countries via the appropriate regional portal.
+    IE/ES/IT share a single portal; UK has its own.
     """
 
-    def __init__(self, session: requests.Session):
+    def __init__(
+        self,
+        session: requests.Session,
+        portal_base: str,
+        country_id: Optional[str] = None,
+    ):
         self.session = session
+        self.portal_base = portal_base
+        self.country_id = country_id
         self._session_established = False
 
     def _establish_session(self) -> bool:
-        """Navigate EU portal → Ireland to establish session cookies."""
+        """Navigate EU portal → target country to establish session cookies."""
         if self._session_established:
             return True
 
@@ -391,17 +600,17 @@ class StarRezScraper:
                 logger.warning("No form on StarRez entry page")
                 return False
 
-            action = form.get("action", "")
+            # Select the target country
+            country_value = self.country_id or "1"  # Default to Ireland
             fields: Dict[str, str] = {}
             for inp in soup.find_all("input"):
                 name = inp.get("name")
                 if name:
                     fields[name] = inp.get("value", "")
 
-            select = soup.find("select")
-            if select:
-                fields[select.get("name", "CheckOrderList")] = "1"  # Ireland
+            fields["CheckOrderList"] = country_value
 
+            action = form.get("action", "")
             post_url = f"https://portal.apartostudent.com/StarRezPortalXEU{action}"
 
             time.sleep(0.3)
@@ -423,7 +632,7 @@ class StarRezScraper:
                 return False
 
             self._session_established = True
-            logger.info("StarRez session established: %s", r3.url)
+            logger.info("StarRez session established for country %s: %s", country_value, r3.url)
             return True
 
         except requests.RequestException as exc:
@@ -434,9 +643,12 @@ class StarRezScraper:
         """
         Probe a single termID by accessing its room search redirect URL.
         Returns StarRezTerm if valid, None if invalid/error.
+
+        Note: target_property_names and property_aliases are set after
+        probing via _annotate_term().
         """
         url = (
-            f"{PORTAL_IE_BASE}/General/RoomSearch/RoomSearch/RedirectToMainFilter"
+            f"{self.portal_base}/General/RoomSearch/RoomSearch/RedirectToMainFilter"
             f"?roomSelectionModelID=361&filterID=1&option=RoomLocationArea&termID={term_id}"
         )
         try:
@@ -470,7 +682,6 @@ class StarRezScraper:
 
         property_name = _extract_property_name(term_name)
         weeks = _parse_weeks_from_name(term_name)
-        is_dublin = _is_dublin_term(term_name)
 
         # For Semester 1 detection, use DD/MM/YYYY if available, else ISO
         is_sem1 = _is_semester1_term(
@@ -484,6 +695,7 @@ class StarRezScraper:
         has_rooms = (
             "room-result" in r.text.lower()
             or "€" in soup.get_text()
+            or "£" in soup.get_text()
             or bool(soup.find(attrs={"data-roombaseid": True}))
         )
 
@@ -496,7 +708,7 @@ class StarRezScraper:
             start_iso=start_iso,
             end_iso=end_iso,
             weeks=weeks,
-            is_dublin=is_dublin,
+            is_target_city=False,  # Will be set by caller
             is_semester1=is_sem1,
             has_rooms=has_rooms,
             booking_url=r.url,
@@ -504,16 +716,19 @@ class StarRezScraper:
 
     def scan_term_range(
         self,
-        start_id: int = TERM_ID_SCAN_START,
-        end_id: int = TERM_ID_SCAN_END,
-        dublin_only: bool = True,
-        delay: float = 0.35,
+        target_property_names: Set[str],
+        property_aliases: Dict[str, str],
+        start_id: int = DEFAULT_TERM_SCAN_START,
+        end_id: int = DEFAULT_TERM_SCAN_END,
+        target_city_only: bool = True,
+        delay: float = 0.15,
     ) -> List[StarRezTerm]:
         """
-        Scan a range of termIDs and return all valid terms.
+        Scan a range of termIDs and return valid terms for the target city.
 
-        This is the core monitoring function. By scanning termIDs periodically,
-        we can detect when new terms (e.g., Semester 1) are added.
+        Uses a smart scanning strategy:
+        1. Start from start_id and scan upward
+        2. Stop after max_consecutive_misses misses past the last hit
         """
         if not self._establish_session():
             logger.error("Failed to establish StarRez session")
@@ -521,33 +736,51 @@ class StarRezScraper:
 
         terms: List[StarRezTerm] = []
         consecutive_misses = 0
+        last_hit_id = start_id
 
         for tid in range(start_id, end_id + 1):
             term = self.probe_term(tid)
             if term:
                 consecutive_misses = 0
-                if dublin_only and not term.is_dublin:
-                    continue
-                terms.append(term)
-                logger.debug(
-                    "Term %d: %s (%s → %s) dublin=%s sem1=%s",
-                    tid, term.term_name, term.start_date, term.end_date,
-                    term.is_dublin, term.is_semester1,
+                last_hit_id = tid
+
+                # Check if this term belongs to the target city
+                is_target = _is_target_city_term(
+                    term.term_name,
+                    target_property_names,
+                    property_aliases,
                 )
+                term.is_target_city = is_target
+
+                if target_city_only and not is_target:
+                    logger.debug(
+                        "Term %d: %s (not target city, skipping)",
+                        tid, term.term_name,
+                    )
+                else:
+                    terms.append(term)
+                    logger.debug(
+                        "Term %d: %s (%s → %s) target=%s sem1=%s",
+                        tid, term.term_name, term.start_date, term.end_date,
+                        term.is_target_city, term.is_semester1,
+                    )
             else:
                 consecutive_misses += 1
-                # Stop scanning if we hit too many consecutive misses
-                # (beyond the known range)
-                if consecutive_misses > 20 and tid > max(KNOWN_DUBLIN_TERM_IDS.keys()) + 30:
-                    logger.debug("Stopping scan at termID %d (20 consecutive misses)", tid)
+                if (consecutive_misses > DEFAULT_TERM_SCAN_MAX_CONSECUTIVE_MISSES
+                        and tid > last_hit_id + DEFAULT_TERM_SCAN_MAX_CONSECUTIVE_MISSES):
+                    logger.debug(
+                        "Stopping scan at termID %d (%d consecutive misses past last hit %d)",
+                        tid, consecutive_misses, last_hit_id,
+                    )
                     break
 
             if delay > 0:
                 time.sleep(delay)
 
+        scanned = min(end_id - start_id + 1, tid - start_id + 1)
         logger.info(
-            "StarRez scan complete: %d/%d termIDs checked, %d Dublin terms found",
-            min(end_id - start_id + 1, tid - start_id + 1),
+            "StarRez scan complete: %d/%d termIDs checked, %d target city terms found",
+            scanned,
             end_id - start_id + 1,
             len(terms),
         )
@@ -559,32 +792,95 @@ class StarRezScraper:
 # ---------------------------------------------------------------------------
 
 class ApartoProvider(BaseProvider):
-    """Aparto provider: StarRez termID probing + main site price scraping."""
+    """
+    Aparto provider: dynamic property discovery + StarRez termID probing.
 
-    def __init__(self):
+    Supports all 14 Aparto cities. Properties are discovered dynamically
+    from the main site; booking terms are probed via StarRez portals.
+    """
+
+    def __init__(
+        self,
+        city: str = "Dublin",
+        country: Optional[str] = None,
+    ):
         self._session = requests.Session()
+        self._city = city.strip().title()
+        self._country = country or self._resolve_country(self._city)
+        self._city_slug = self._resolve_city_slug(self._city)
+        self._portal_config = COUNTRY_PORTAL_MAP.get(self._country, {})
+        self._discovered_properties: Optional[List[Dict[str, str]]] = None
+        self._property_names: Optional[Set[str]] = None
+        self._property_aliases: Optional[Dict[str, str]] = None
+
+    @staticmethod
+    def _resolve_country(city: str) -> str:
+        """Resolve country from city name."""
+        # Try exact match first
+        country = CITY_COUNTRY_MAP.get(city)
+        if country:
+            return country
+        # Try case-insensitive match
+        city_lower = city.lower()
+        for k, v in CITY_COUNTRY_MAP.items():
+            if k.lower() == city_lower:
+                return v
+        logger.warning("Unknown city '%s', defaulting to Ireland", city)
+        return "Ireland"
+
+    @staticmethod
+    def _resolve_city_slug(city: str) -> str:
+        """Resolve URL slug from city name."""
+        slug = CITY_SLUG_MAP.get(city)
+        if slug:
+            return slug
+        city_lower = city.lower()
+        for k, v in CITY_SLUG_MAP.items():
+            if k.lower() == city_lower:
+                return v
+        return city.lower().replace(" ", "-")
+
+    def _ensure_properties_discovered(self) -> None:
+        """Lazy-discover properties for the target city."""
+        if self._discovered_properties is not None:
+            return
+
+        self._discovered_properties = _discover_city_properties(
+            self._session, self._city_slug,
+        )
+        self._property_names = {p["name"] for p in self._discovered_properties}
+        self._property_aliases = _build_property_aliases(self._discovered_properties)
+
+        logger.info(
+            "Aparto: discovered %d properties for %s: %s",
+            len(self._discovered_properties),
+            self._city,
+            [p["name"] for p in self._discovered_properties],
+        )
 
     @property
     def name(self) -> str:
         return "aparto"
 
     def discover_properties(self) -> List[Dict[str, Any]]:
-        """Return static list of known Dublin properties."""
+        """Dynamically discover properties for the configured city."""
+        self._ensure_properties_discovered()
         props = []
-        for prop in DUBLIN_PROPERTIES:
-            url = f"{MAIN_BASE}/locations/dublin/{prop['slug']}"
+        for prop in self._discovered_properties:
             props.append({
                 "slug": prop["slug"],
                 "name": prop["name"],
-                "location": prop["location"],
-                "url": url,
+                "location": prop.get("location", ""),
+                "url": prop["url"],
                 "provider": "aparto",
+                "city": self._city,
+                "country": self._country,
             })
         return props
 
     def _scrape_property(self, prop: Dict[str, str]) -> List[Dict[str, Any]]:
         """Scrape a single property page for room types + prices."""
-        url = f"{MAIN_BASE}/locations/dublin/{prop['slug']}"
+        url = prop.get("url") or f"{MAIN_BASE}/locations/{self._city_slug}/{prop['slug']}"
         html = _fetch(self._session, url)
         if not html:
             logger.warning("Aparto: could not fetch %s", url)
@@ -605,7 +901,7 @@ class ApartoProvider(BaseProvider):
             room.update({
                 "property_name": prop["name"],
                 "property_slug": prop["slug"],
-                "location": prop["location"],
+                "location": prop.get("location", ""),
                 "page_url": url,
             })
 
@@ -621,23 +917,45 @@ class ApartoProvider(BaseProvider):
         Full scan: probe StarRez termIDs + scrape main site for prices.
 
         Strategy:
-        1. Scan termIDs to find all Dublin booking terms
-        2. Filter for Semester 1 terms (or return all if filter is off)
-        3. Enrich with pricing data from the main site
+        1. Discover properties for the target city
+        2. Scan termIDs to find booking terms matching those properties
+        3. Filter for Semester 1 terms (or return all if filter is off)
+        4. Enrich with pricing data from the main site
         """
+        self._ensure_properties_discovered()
         results: List[RoomOption] = []
 
+        portal_base = self._portal_config.get("portal_base")
+        if not portal_base:
+            logger.warning(
+                "Aparto: no StarRez portal for %s (%s). Scan not available.",
+                self._city, self._country,
+            )
+            return results
+
         # Step 1: Probe StarRez termIDs
-        scraper = StarRezScraper(self._session)
-        all_terms = scraper.scan_term_range(dublin_only=True)
-        logger.info("Aparto: found %d Dublin terms", len(all_terms))
+        scraper = StarRezScraper(
+            self._session,
+            portal_base=portal_base,
+            country_id=self._portal_config.get("country_id"),
+        )
+        all_terms = scraper.scan_term_range(
+            target_property_names=self._property_names,
+            property_aliases=self._property_aliases,
+            target_city_only=True,
+        )
+        logger.info("Aparto: found %d terms for %s", len(all_terms), self._city)
 
         # Filter by academic year (26/27)
+        year_short = academic_year.replace("-", "/")[-5:]  # "2026-27" → "26/27"
         year_terms = [
             t for t in all_terms
-            if "26/27" in t.term_name or (
-                t.start_iso and t.start_iso.startswith("2026") and
-                t.end_iso and (t.end_iso.startswith("2027") or t.end_iso.startswith("2026"))
+            if year_short in t.term_name or (
+                t.start_iso and t.start_iso.startswith(academic_year[:4]) and
+                t.end_iso and (
+                    t.end_iso.startswith(f"20{academic_year[-2:]}") or
+                    t.end_iso.startswith(academic_year[:4])
+                )
             )
         ]
 
@@ -661,8 +979,8 @@ class ApartoProvider(BaseProvider):
 
         # Step 2: Get pricing data from main site
         property_rooms: Dict[str, List[Dict]] = {}
-        prop_lookup = {p["name"].lower(): p for p in DUBLIN_PROPERTIES}
-        for prop in DUBLIN_PROPERTIES:
+        prop_lookup = {_normalise_name(p["name"]): p for p in self._discovered_properties}
+        for prop in self._discovered_properties:
             time.sleep(0.5)
             rooms = self._scrape_property(prop)
             if rooms:
@@ -670,15 +988,26 @@ class ApartoProvider(BaseProvider):
 
         # Step 3: Build RoomOptions
         for term in target_terms:
-            prop_info = prop_lookup.get(term.property_name.lower())
-            if not prop_info:
-                for key, val in prop_lookup.items():
-                    if term.property_name.lower() in key or key in term.property_name.lower():
-                        prop_info = val
-                        break
+            prop_info = None
+            term_prop_norm = _normalise_name(term.property_name)
+
+            # Try direct match
+            for norm_name, info in prop_lookup.items():
+                if norm_name in term_prop_norm or term_prop_norm in norm_name:
+                    prop_info = info
+                    break
+
+            # Try alias match
+            if not prop_info and self._property_aliases:
+                canonical = self._property_aliases.get(term_prop_norm)
+                if canonical:
+                    for norm_name, info in prop_lookup.items():
+                        if _normalise_name(canonical) == norm_name:
+                            prop_info = info
+                            break
 
             slug = prop_info["slug"] if prop_info else term.property_name.lower().replace(" ", "-")
-            location = prop_info["location"] if prop_info else ""
+            location = prop_info.get("location", "") if prop_info else ""
 
             rooms = property_rooms.get(slug, [])
             if not rooms:
@@ -705,6 +1034,8 @@ class ApartoProvider(BaseProvider):
                         "is_semester1": term.is_semester1,
                         "start_date_dd": term.start_date,
                         "end_date_dd": term.end_date,
+                        "city": self._city,
+                        "country": self._country,
                     },
                 ))
 
@@ -712,15 +1043,36 @@ class ApartoProvider(BaseProvider):
 
     def probe_booking(self, option: RoomOption) -> Dict[str, Any]:
         """Deep-probe for a specific option."""
-        scraper = StarRezScraper(self._session)
-        all_terms = scraper.scan_term_range(dublin_only=True)
+        self._ensure_properties_discovered()
+
+        portal_base = self._portal_config.get("portal_base")
+        if not portal_base:
+            return {
+                "match": {"property": option.property_name, "room": option.room_type},
+                "error": f"No StarRez portal for {self._city} ({self._country})",
+            }
+
+        scraper = StarRezScraper(
+            self._session,
+            portal_base=portal_base,
+            country_id=self._portal_config.get("country_id"),
+        )
+        all_terms = scraper.scan_term_range(
+            target_property_names=self._property_names,
+            property_aliases=self._property_aliases,
+            target_city_only=True,
+        )
 
         term_id = option.raw.get("term_id")
         matching_term = None
         if term_id:
             matching_term = next((t for t in all_terms if t.term_id == term_id), None)
 
-        semester1_terms = [t for t in all_terms if t.is_semester1 and "26/27" in t.term_name]
+        year_short = (option.academic_year or "2026-27").replace("-", "/")[-5:]
+        semester1_terms = [
+            t for t in all_terms
+            if t.is_semester1 and year_short in t.term_name
+        ]
 
         return {
             "match": {
@@ -729,11 +1081,13 @@ class ApartoProvider(BaseProvider):
                 "academicYear": option.academic_year,
                 "termName": matching_term.term_name if matching_term else "N/A",
                 "hasSemester1": bool(semester1_terms),
+                "city": self._city,
+                "country": self._country,
             },
             "portalState": {
-                "dublinTermCount": len([t for t in all_terms if "26/27" in t.term_name]),
+                "termCount": len([t for t in all_terms if year_short in t.term_name]),
                 "semester1Count": len(semester1_terms),
-                "allDublinTerms": [
+                "allTerms": [
                     {
                         "name": t.term_name,
                         "termId": t.term_id,
@@ -742,12 +1096,12 @@ class ApartoProvider(BaseProvider):
                         "weeks": t.weeks,
                         "isSemester1": t.is_semester1,
                     }
-                    for t in all_terms if "26/27" in t.term_name
+                    for t in all_terms if year_short in t.term_name
                 ],
             },
             "links": {
                 "bookingPortal": STARREZ_ENTRY_URL,
-                "propertyPage": f"{MAIN_BASE}/locations/dublin/{option.property_slug}",
+                "propertyPage": f"{MAIN_BASE}/locations/{self._city_slug}/{option.property_slug}",
                 "termLink": matching_term.booking_url if matching_term else None,
             },
             "raw": option.raw,

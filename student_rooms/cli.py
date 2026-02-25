@@ -88,7 +88,10 @@ def make_providers(
 
     if want_aparto and aparto_enabled:
         from student_rooms.providers.aparto import ApartoProvider
-        instances.append(ApartoProvider())
+        instances.append(ApartoProvider(
+            city=city or config.target.city or "Dublin",
+            country=country or config.target.country,
+        ))
 
     return instances
 
@@ -494,9 +497,9 @@ def _add_provider_arg(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_location_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--country", help="Country name (Yugo only).")
+    parser.add_argument("--country", help="Country name.")
     parser.add_argument("--country-id", dest="country_id", help="Country ID (Yugo only).")
-    parser.add_argument("--city", help="City name (Yugo only).")
+    parser.add_argument("--city", help="City name.")
     parser.add_argument("--city-id", dest="city_id", help="City ID (Yugo only).")
 
 

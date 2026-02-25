@@ -1,3 +1,11 @@
+# dublin-rooms config — Álvaro Erasmus Dublin Semester 1 2026-27
+
+providers:
+  yugo:
+    enabled: true
+  aparto:
+    enabled: true
+
 target:
   country: "Ireland"
   city: "Dublin"
@@ -14,7 +22,6 @@ academic_year:
   start_year: 2026
   end_year: 2027
   semester1:
-    # Strict: only Semester 1 labels (no 38/41 weeks variants)
     name_keywords:
       - "semester 1"
     require_keyword: true
@@ -29,13 +36,13 @@ polling:
 notifications:
   openclaw:
     enabled: false
-    mode: "message" # message | agent
+    mode: "message"   # message | agent
     channel: "telegram"
     target: "1473631236"
 
-    # Optional: instant reservation-assist job creation when a match appears
+    # Instant reservation-assist job on match
     create_job_on_match: false
-    reservation_mode: "assist" # assist | autobook
+    reservation_mode: "assist"   # assist | autobook
     job_model: "anthropic/claude-sonnet-4-6"
     job_timeout_seconds: 600
     # job_channel: "telegram"

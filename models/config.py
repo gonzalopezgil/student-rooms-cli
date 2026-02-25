@@ -37,6 +37,24 @@ class AcademicYearConfig:
     end_year: Optional[int] = None
     semester1: Semester1Rules = field(default_factory=Semester1Rules)
 
+    def academic_year_str(self) -> str:
+        """Return e.g. '2026-27' from start/end years."""
+        if self.start_year and self.end_year:
+            short_end = self.end_year % 100
+            return f"{self.start_year}-{short_end:02d}"
+        return "2026-27"
+
+
+@dataclass
+class ProviderConfig:
+    enabled: bool = True
+
+
+@dataclass
+class ProvidersConfig:
+    yugo_enabled: bool = True
+    aparto_enabled: bool = True
+
 
 @dataclass
 class PollingConfig:
@@ -72,6 +90,7 @@ class Config:
     academic_year: AcademicYearConfig = field(default_factory=AcademicYearConfig)
     polling: PollingConfig = field(default_factory=PollingConfig)
     notifications: NotificationConfig = field(default_factory=NotificationConfig)
+    providers: ProvidersConfig = field(default_factory=ProvidersConfig)
 
 
 def _get_dict(data, key, default=None):
@@ -127,6 +146,7 @@ def load_config(yaml_path: str = "config.yaml", ini_path: Optional[str] = None) 
     polling_data = _get_dict(data, "polling", {})
     notify_data = _get_dict(data, "notifications", {})
     openclaw_data = _get_dict(notify_data, "openclaw", {})
+    providers_data = _get_dict(data, "providers", {})
 
     config = Config(
         target=TargetConfig(
@@ -171,6 +191,10 @@ def load_config(yaml_path: str = "config.yaml", ini_path: Optional[str] = None) 
                 job_channel=openclaw_data.get("job_channel"),
                 job_target=openclaw_data.get("job_target"),
             )
+        ),
+        providers=ProvidersConfig(
+            yugo_enabled=bool(_get_dict(providers_data, "yugo", {}).get("enabled", True)),
+            aparto_enabled=bool(_get_dict(providers_data, "aparto", {}).get("enabled", True)),
         ),
     )
 

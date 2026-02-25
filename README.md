@@ -1,33 +1,38 @@
-# Yugo Scraper (Agent-ready CLI)
+# dublin-rooms
 
-Yugo Scraper is a Python CLI to discover, filter, and monitor Yugo accommodation options.
-It is designed so OpenClaw agents can operate it directly (scan, prioritize, generate booking links, notify, and optionally create follow-up jobs).
+**Multi-provider Dublin student accommodation CLI.**
 
-## What it does now
+Monitors Yugo and Aparto properties for Semester 1 availability (Sept–Jan 2026-27 academic year).
+Sends Telegram alerts via OpenClaw for any new matching options detected.
 
-- Non-interactive CLI workflow:
-  - `discover`
-  - `scan`
-  - `watch`
-  - `test-match`
-  - `notify`
-  - `probe-booking`
-- Strict Semester 1 matching policy (configurable).
-- Prioritization logic: **ensuite first**, then **cheapest**.
-- Booking-flow probing (CLI-first):
-  - `available-beds`
-  - `flats-with-beds`
-  - `skip-room-selection`
-  - `student-portal-redirect`
-- OpenClaw-native notifications and optional instant job creation.
+Built for: Álvaro López Gil — Erasmus Dublin 2026-27, Semester 1.
 
-## Not in scope (yet)
+## Providers
 
-- Full irreversible checkout by pure API only. Final reservation completion usually continues in browser/student portal.
+| Provider | Source | Method |
+|---|---|---|
+| **Yugo** | `yugo.com` JSON API | REST API (no auth needed) |
+| **Aparto** | `apartostudent.com` HTML + StarRez portal | Web scraping (BeautifulSoup) |
+
+## Dublin Properties
+
+### Yugo
+Auto-discovered via API (country: Ireland → city: Dublin).
+
+### Aparto
+| Property | Location |
+|---|---|
+| Binary Hub | Bonham St, Dublin 8 |
+| Beckett House | Pearse St, Dublin 2 |
+| Dorset Point | Dorset St, Dublin 1 |
+| Montrose | Stillorgan Rd (near UCD) |
+| The Loom | Dublin |
+| Stephen's Quarter | Dublin 2 |
 
 ## Installation
 
 ```bash
+cd yugo-scraper
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -35,17 +40,21 @@ pip install -r requirements.txt
 
 ## Configuration
 
-Use `config.yaml` (or pass `--config <path>`).
+Edit `config.yaml`:
 
-For Dublin 26/27 starter config, see:
+```yaml
+providers:
+  yugo:
+    enabled: true
+  aparto:
+    enabled: true
 
-- `config.dublin.26-27.sample.yaml`
-
-Key sections:
-
-- `academic_year.semester1.name_keywords`: strict matching tokens (default: only `semester 1`)
-- `academic_year.semester1.enforce_month_window`: enforce Sep/Oct -> Jan/Feb shape
-- `notifications.openclaw`: Telegram (or other channel) delivery + optional job creation
+notifications:
+  openclaw:
+    enabled: true        # set to true to get Telegram alerts
+    channel: "telegram"
+    target: "1473631236" # Gonzalo's Telegram ID
+```
 
 ## Usage
 
@@ -53,59 +62,117 @@ Key sections:
 python main.py --help
 ```
 
-### Discover
+### Discover properties
 
 ```bash
-python main.py discover --countries
-python main.py discover --cities --country "Ireland"
-python main.py discover --residences --city "Dublin" --country "Ireland"
+# All providers
+python main.py discover
+
+# Specific provider
+python main.py discover --provider yugo
+python main.py discover --provider aparto
+
+# JSON output
+python main.py discover --json
 ```
 
-### Scan
+### Single scan (Semester 1 filter)
 
 ```bash
-# strict Semester 1 (default from config)
-python main.py scan --city "Dublin" --country "Ireland"
+# All providers
+python main.py scan
 
-# debugging / current market inventory regardless of semester rules
-python main.py scan --city "Dublin" --country "Ireland" --all-options --json
+# Yugo only
+python main.py scan --provider yugo
+
+# Aparto only
+python main.py scan --provider aparto
+
+# Skip semester filter (debug all options)
+python main.py scan --all-options --json
+
+# Scan and notify if match found
+python main.py scan --notify
 ```
 
-### Watch loop
+### Watch loop (continuous monitoring)
 
 ```bash
-python main.py watch --city "Dublin" --country "Ireland"
+# Monitor all providers, alert on new options
+python main.py watch
+
+# Monitor only Aparto
+python main.py watch --provider aparto
 ```
 
-### Probe booking flow (generate booking link + context)
+The watcher:
+- Polls every 60s (±15s jitter)
+- Deduplicates: won't alert twice for the same option
+- Persists seen options to `reports/seen_options.json` (survives restarts)
+- Sends Telegram alert for any new Semester 1 option detected
+
+### Deep booking probe
 
 ```bash
-# strict matches from config
-python main.py probe-booking --city "Dublin" --country "Ireland" --json
+# Probe all providers
+python main.py probe-booking --json
 
-# force current available options (useful for testing)
-python main.py probe-booking \
-  --city "Dublin" --country "Ireland" \
-  --all-options --tenancy "41 Weeks" --residence "Dominick" --json
+# Probe Yugo specifically (generates booking links)
+python main.py probe-booking --provider yugo --json
+
+# Probe Aparto (navigates StarRez portal)
+python main.py probe-booking --provider aparto --json
+
+# Filter by property/room
+python main.py probe-booking --residence "Binary Hub" --json
 ```
 
-### Notification test
+### Test notification
 
 ```bash
-python main.py notify --message "Yugo test"
+python main.py notify --message "Test alert 🏠"
 ```
 
-## Notes for agents
+### Test semester matching (Yugo legacy)
 
-- Prefer `probe-booking --json` before browser automation.
-- Use returned `skipRoomLink`/`handoverLink` as entry point to student portal booking process.
-- If `notifications.openclaw.create_job_on_match=true`, scanner can auto-create an immediate isolated OpenClaw job.
+```bash
+python main.py test-match --from-year 2026 --to-year 2027 \
+  --start-date 2026-09-01 --end-date 2027-01-31
+```
 
-## Reference docs
+## Dedup / Seen Options
 
-- `MIGRATION_PHASE_A.md`
-- `BOOKING_AUTOMATION_ANALYSIS.md`
+The watcher writes `reports/seen_options.json` after each cycle. Delete this file to re-alert on already-seen options.
+
+## Alert Format
+
+```
+🚨 NUEVO · Dublin Rooms · Semester 1 detectado
+
+⭐ Opción prioritaria:
+🏠 Binary Hub (APARTO)
+🛏 Gold Ensuite
+💶 €320/week
+📍 Bonham St, Dublin 8
+🔗 https://portal.apartostudent.com/...
+
+📋 3 opciones totales (top 5 alternativas):
+  2. [YUGO] Dominick Street | Standard Ensuite | €310/week
+```
+
+## Notes for Agents
+
+- **Yugo**: Use `probe-booking --provider yugo --json` to get `skipRoomLink`/`handoverLink` for direct browser handoff
+- **Aparto**: Use `probe-booking --provider aparto --json` to get StarRez portal status + entry URL
+- Once a match is found, navigate to the booking URL in browser and complete the form
+- Do NOT attempt irreversible payment actions automatically
+
+## Docs
+
+- `TASK.md` — original refactoring spec
+- `APARTO_RESEARCH.md` — Aparto site architecture research
+- `BOOKING_AUTOMATION_ANALYSIS.md` — booking flow analysis
 
 ## License
 
-MIT (see `LICENSE`).
+MIT

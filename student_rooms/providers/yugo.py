@@ -6,18 +6,18 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import requests
 
-from providers.base import BaseProvider, RoomOption
+from student_rooms.providers.base import BaseProvider, RoomOption
 
 logger = logging.getLogger(__name__)
 
 API_PREFIX = "https://yugo.com/en-gb/"
 
 # ---------------------------------------------------------------------------
-# Low-level API client (moved from client.py)
+# Low-level API client
 # ---------------------------------------------------------------------------
 
 class YugoClient:
@@ -134,7 +134,7 @@ def find_by_name(items: List[Dict[str, Any]], name: Optional[str]) -> Optional[D
 
 
 # ---------------------------------------------------------------------------
-# Helpers (moved from matching.py-compatible helpers used here)
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _has_private_arrangement(room: Dict, key: str) -> Optional[bool]:
@@ -230,11 +230,10 @@ class YugoProvider(BaseProvider):
         to_year = group.get("toYear")
         try:
             start_year, end_year = (int(y) for y in academic_year.split("-"))
-            # "2026-27" → 2026, 2027
             if end_year < 100:
                 end_year = (from_year // 100) * 100 + end_year if from_year else end_year + 2000
         except (ValueError, AttributeError):
-            return True  # if we can't parse, don't filter
+            return True
 
         if from_year is not None and int(from_year) != start_year:
             return False
@@ -245,7 +244,7 @@ class YugoProvider(BaseProvider):
     def _is_semester1_option(self, option: Dict[str, Any]) -> bool:
         """
         Check if a tenancy option is Semester 1.
-        
+
         Detection methods (any match = True):
         1. Name/label contains "semester 1" keyword
         2. Short duration (~20 weeks) with Sep-Oct start and Jan-Feb end
@@ -254,13 +253,13 @@ class YugoProvider(BaseProvider):
             str(option.get("name", "")),
             str(option.get("formattedLabel", "")),
         ]).lower()
-        
+
         SEMESTER1_KEYWORDS = ["semester 1", "sem 1", "first semester", "semester1"]
         has_keyword = any(kw in label for kw in SEMESTER1_KEYWORDS)
-        
+
         start_date = option.get("startDate", "")
         end_date = option.get("endDate", "")
-        
+
         start_dt = None
         end_dt = None
         if start_date:
@@ -275,7 +274,7 @@ class YugoProvider(BaseProvider):
                 end_dt = dt.strptime(end_date, "%Y-%m-%d")
             except ValueError:
                 pass
-        
+
         # Method 1: Keyword match + date validation
         if has_keyword:
             if start_dt and start_dt.month not in (8, 9, 10):
@@ -283,7 +282,7 @@ class YugoProvider(BaseProvider):
             if end_dt and end_dt.month not in (12, 1, 2):
                 return False
             return True
-        
+
         # Method 2: Duration-based detection (no keyword needed)
         if start_dt and end_dt:
             duration_weeks = (end_dt - start_dt).days / 7
@@ -291,7 +290,7 @@ class YugoProvider(BaseProvider):
                 start_dt.month in (8, 9, 10) and
                 end_dt.month in (12, 1, 2)):
                 return True
-        
+
         return False
 
     def scan(

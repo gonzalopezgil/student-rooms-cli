@@ -24,7 +24,7 @@ from datetime import datetime
 import requests
 from bs4 import BeautifulSoup
 
-from providers.base import BaseProvider, RoomOption
+from student_rooms.providers.base import BaseProvider, RoomOption
 
 logger = logging.getLogger(__name__)
 

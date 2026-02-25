@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Dict, Optional
 
-from models.config import AcademicYearConfig, FilterConfig
+from student_rooms.models.config import AcademicYearConfig, FilterConfig
 
 
 def _has_private_arrangement(room: Dict, key: str) -> Optional[bool]:
@@ -127,13 +127,11 @@ def match_semester1(option: Dict, academic_year: AcademicYearConfig) -> bool:
         start_dt = _parse_yyyy_mm_dd(tenancy_item.get("startDate"))
         end_dt = _parse_yyyy_mm_dd(tenancy_item.get("endDate"))
 
-        # If dates exist, enforce exact Semester-1 window constraints.
         if start_dt and start_dt.month not in set(academic_year.semester1.start_months):
             return False
         if end_dt and end_dt.month not in set(academic_year.semester1.end_months):
             return False
 
-        # If we have both dates, enforce cross-year shape (Sep/Oct -> Jan/Feb next year)
         if start_dt and end_dt and end_dt.year <= start_dt.year:
             return False
 

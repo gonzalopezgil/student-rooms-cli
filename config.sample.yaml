@@ -1,0 +1,68 @@
+# student-rooms-cli configuration
+# Copy to config.yaml and edit to your needs.
+
+providers:
+  yugo:
+    enabled: true
+  aparto:
+    enabled: true
+
+target:
+  country: "Ireland"
+  city: "Dublin"
+  # Optional: pre-set IDs to skip discovery (speeds up Yugo queries)
+  # country_id: "598930"
+  # city_id: "598808"
+
+filters:
+  private_bathroom: null       # true | false | null (any)
+  private_kitchen: null        # true | false | null (any)
+  max_weekly_price: null       # e.g. 350.0
+  max_monthly_price: null      # e.g. 1500.0
+
+academic_year:
+  start_year: 2026
+  end_year: 2027
+  semester1:
+    name_keywords:
+      - "semester 1"
+      - "sem 1"
+      - "first semester"
+    require_keyword: true
+    enforce_month_window: true
+    start_months: [8, 9, 10]
+    end_months: [12, 1, 2]
+
+polling:
+  interval_seconds: 3600       # 1 hour for watch mode
+  jitter_seconds: 300          # random jitter to avoid patterns
+
+# Notification backend: stdout | webhook | telegram | openclaw
+notifications:
+  type: "stdout"               # default: just print to console
+
+  # --- Webhook (Discord, Slack, ntfy.sh, etc.) ---
+  # webhook:
+  #   enabled: true
+  #   url: "https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN"
+  #   method: "POST"
+  #   headers: {}
+  #   body_template: '{"content": "{message}"}'  # {message} is replaced
+
+  # --- Telegram Bot API (direct, no OpenClaw needed) ---
+  # telegram:
+  #   enabled: true
+  #   bot_token: "YOUR_BOT_TOKEN"
+  #   chat_id: "YOUR_CHAT_ID"
+  #   parse_mode: null           # "HTML" | "Markdown" | null
+
+  # --- OpenClaw integration (for OpenClaw users) ---
+  # openclaw:
+  #   enabled: true
+  #   mode: "message"            # message | agent
+  #   channel: "telegram"
+  #   target: "YOUR_CHAT_ID"
+  #   create_job_on_match: false
+  #   reservation_mode: "assist" # assist | autobook
+  #   job_model: "anthropic/claude-sonnet-4-6"
+  #   job_timeout_seconds: 600

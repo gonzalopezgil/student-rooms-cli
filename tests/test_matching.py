@@ -1,7 +1,7 @@
 import unittest
 
-from matching import match_semester1
-from models.config import AcademicYearConfig, Semester1Rules
+from student_rooms.matching import match_semester1
+from student_rooms.models.config import AcademicYearConfig, Semester1Rules
 
 
 class TestSemester1Matching(unittest.TestCase):

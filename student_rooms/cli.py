@@ -1,5 +1,5 @@
 """
-cli.py — dublin-rooms CLI entry point.
+student_rooms.cli — student-rooms-cli entry point.
 
 Commands: discover | scan | watch | probe-booking | notify | test-match
 Providers: --provider yugo | aparto | all  (default: all)
@@ -15,9 +15,9 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from models.config import Config, load_config
-from notifier import notify, validate_notification_config
-from providers.base import RoomOption
+from student_rooms.models.config import Config, load_config
+from student_rooms.notifiers.base import create_notifier
+from student_rooms.providers.base import RoomOption
 
 logger = logging.getLogger(__name__)
 
@@ -25,10 +25,16 @@ logger = logging.getLogger(__name__)
 # Dedup persistence
 # ---------------------------------------------------------------------------
 
-SEEN_FILE = os.path.join(os.path.dirname(__file__), "reports", "seen_options.json")
+SEEN_FILE = os.path.join(os.path.dirname(__file__), "..", "reports", "seen_options.json")
 
 
-def load_seen_keys(path: str = SEEN_FILE) -> Set[str]:
+def _default_seen_path() -> str:
+    """Return path for seen_options.json, preferring a 'reports' dir next to config."""
+    return os.path.abspath(SEEN_FILE)
+
+
+def load_seen_keys(path: Optional[str] = None) -> Set[str]:
+    path = path or _default_seen_path()
     try:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
@@ -39,7 +45,8 @@ def load_seen_keys(path: str = SEEN_FILE) -> Set[str]:
     return set()
 
 
-def save_seen_keys(keys: Set[str], path: str = SEEN_FILE) -> None:
+def save_seen_keys(keys: Set[str], path: Optional[str] = None) -> None:
+    path = path or _default_seen_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(sorted(keys), fh, ensure_ascii=False, indent=2)
@@ -71,7 +78,7 @@ def make_providers(
     want_aparto = provider_arg in ("aparto", "all")
 
     if want_yugo and yugo_enabled:
-        from providers.yugo import YugoProvider
+        from student_rooms.providers.yugo import YugoProvider
         instances.append(YugoProvider(
             country=country or config.target.country or "Ireland",
             city=city or config.target.city or "Dublin",
@@ -80,7 +87,7 @@ def make_providers(
         ))
 
     if want_aparto and aparto_enabled:
-        from providers.aparto import ApartoProvider
+        from student_rooms.providers.aparto import ApartoProvider
         instances.append(ApartoProvider())
 
     return instances
@@ -109,17 +116,17 @@ def build_alert_message(
     provider_probe: Optional[Dict[str, Any]] = None,
     is_new: bool = True,
 ) -> str:
-    """Build Telegram alert for matched room options (multi-provider)."""
+    """Build alert message for matched room options (multi-provider)."""
     if not matches:
         return ""
 
     top = matches[0]
-    flag = "🚨 NUEVO" if is_new else "🔁 RECORDATORIO"
+    flag = "🚨 NEW" if is_new else "🔁 REMINDER"
 
     lines = [
-        f"{flag} · Dublin Rooms · Semester 1 detectado",
+        f"{flag} · Student Rooms · Semester 1 detected",
         "",
-        "⭐ Opción prioritaria:",
+        "⭐ Top match:",
     ]
     lines.extend(top.alert_lines())
 
@@ -131,10 +138,10 @@ def build_alert_message(
             or provider_probe.get("links", {}).get("bookingPortal")
         )
         if link:
-            lines.append(f"🔗 Reserva: {link}")
+            lines.append(f"🔗 Book: {link}")
 
     if len(matches) > 1:
-        lines.extend(["", f"📋 {len(matches)} opciones totales (top 5 alternativas):"])
+        lines.extend(["", f"📋 {len(matches)} total options (top 5 alternatives):"])
         for idx, m in enumerate(matches[1:6], start=2):
             price = f"€{m.price_weekly:.0f}/week" if m.price_weekly else m.price_label or "N/A"
             lines.append(f"  {idx}. [{m.provider.upper()}] {m.property_name} | {m.room_type} | {price}")
@@ -251,7 +258,8 @@ def handle_scan(args: argparse.Namespace, config: Config) -> int:
         print(f"Total matches: {len(ranked)}")
 
     if getattr(args, "notify", False) and ranked:
-        error = validate_notification_config(config.notifications)
+        notifier = create_notifier(config.notifications)
+        error = notifier.validate()
         if error:
             print(error)
             return 2
@@ -267,7 +275,7 @@ def handle_scan(args: argparse.Namespace, config: Config) -> int:
             logger.warning("Booking probe for notify failed: %s", exc)
 
         message = build_alert_message(ranked, probe, is_new=True)
-        notify(message, config.notifications)
+        notifier.send(message)
 
     return 0
 
@@ -284,6 +292,8 @@ def handle_watch(args: argparse.Namespace, config: Config) -> int:
     academic_year = config.academic_year.academic_year_str()
     interval = max(5, config.polling.interval_seconds)
     jitter = max(0, config.polling.jitter_seconds)
+
+    notifier = create_notifier(config.notifications)
 
     seen_keys = load_seen_keys()
     logger.info(
@@ -317,24 +327,23 @@ def handle_watch(args: argparse.Namespace, config: Config) -> int:
             logger.info("NEW options detected: %d", len(new_matches))
             print(f"✅ NEW match(es) detected: {len(new_matches)}")
 
-            if config.notifications.openclaw.enabled:
-                error = validate_notification_config(config.notifications)
-                if error:
-                    logger.error(error)
-                else:
-                    # Try to get booking probe for top new match
-                    probe = None
-                    top_new = new_matches[0]
-                    try:
-                        provider_inst = next(
-                            p for p in providers if p.name == top_new.provider
-                        )
-                        probe = provider_inst.probe_booking(top_new)
-                    except (StopIteration, NotImplementedError, Exception) as exc:
-                        logger.warning("Watch probe failed: %s", exc)
+            error = notifier.validate()
+            if error:
+                logger.error(error)
+            else:
+                # Try to get booking probe for top new match
+                probe = None
+                top_new = new_matches[0]
+                try:
+                    provider_inst = next(
+                        p for p in providers if p.name == top_new.provider
+                    )
+                    probe = provider_inst.probe_booking(top_new)
+                except (StopIteration, NotImplementedError, Exception) as exc:
+                    logger.warning("Watch probe failed: %s", exc)
 
-                    message = build_alert_message(new_matches, probe, is_new=True)
-                    notify(message, config.notifications)
+                message = build_alert_message(new_matches, probe, is_new=True)
+                notifier.send(message)
 
             # Add new keys to seen set and persist
             for m in new_matches:
@@ -412,12 +421,13 @@ def handle_probe_booking(args: argparse.Namespace, config: Config) -> int:
         return 1
 
     if getattr(args, "notify", False):
-        error = validate_notification_config(config.notifications)
+        notifier = create_notifier(config.notifications)
+        error = notifier.validate()
         if error:
             print(error)
             return 2
         message = build_alert_message(candidates, probe, is_new=True)
-        notify(message, config.notifications)
+        notifier.send(message)
 
     if args.json:
         print(json.dumps(probe, ensure_ascii=False, indent=2))
@@ -438,19 +448,20 @@ def handle_probe_booking(args: argparse.Namespace, config: Config) -> int:
 
 
 def handle_notify(args: argparse.Namespace, config: Config) -> int:
-    error = validate_notification_config(config.notifications)
+    notifier = create_notifier(config.notifications)
+    error = notifier.validate()
     if error:
         print(error)
         return 2
-    message = args.message or "Dublin Rooms notification test 🏠"
-    notify(message, config.notifications)
+    message = args.message or "Student Rooms notification test 🏠"
+    notifier.send(message)
     print("Notification dispatched.")
     return 0
 
 
 def handle_test_match(args: argparse.Namespace, config: Config) -> int:
     """Backwards-compatible test-match for Yugo semester logic."""
-    from matching import match_semester1
+    from student_rooms.matching import match_semester1
     option = {
         "fromYear": args.from_year,
         "toYear": args.to_year,
@@ -491,8 +502,8 @@ def _add_location_args(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="dublin-rooms",
-        description="Dublin Rooms CLI — monitor Yugo + Aparto student accommodation",
+        prog="student-rooms",
+        description="student-rooms-cli — Multi-provider student accommodation finder and monitor",
     )
     parser.add_argument("--config", default="config.yaml", help="Path to YAML config.")
 
@@ -503,13 +514,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_provider_arg(discover)
     _add_location_args(discover)
     discover.add_argument("--json", action="store_true", help="Output JSON.")
-    # Legacy flags (Yugo-only)
     discover.add_argument("--countries", action="store_true", help="[Yugo] List countries.")
     discover.add_argument("--cities", action="store_true", help="[Yugo] List cities.")
     discover.add_argument("--residences", action="store_true", help="[Yugo] List residences.")
 
     # scan
-    scan = sub.add_parser("scan", help="Single-pass scan for Semester 1 availability.")
+    scan = sub.add_parser("scan", help="Single-pass scan for semester availability.")
     _add_provider_arg(scan)
     _add_location_args(scan)
     scan.add_argument("--all-options", action="store_true", dest="all_options",
@@ -518,7 +528,7 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--json", action="store_true", help="Output JSON.")
 
     # watch
-    watch = sub.add_parser("watch", help="Continuous monitoring loop (60s interval).")
+    watch = sub.add_parser("watch", help="Continuous monitoring loop with alerts.")
     _add_provider_arg(watch)
     _add_location_args(watch)
 

@@ -39,7 +39,7 @@ class RoomOption:
         ])
 
     def alert_lines(self) -> List[str]:
-        """Human-readable summary lines for Telegram alerts."""
+        """Human-readable summary lines for alerts."""
         price_str = f"€{self.price_weekly:.0f}/week" if self.price_weekly else self.price_label or "N/A"
         lines = [
             f"🏠 {self.property_name} ({self.provider.upper()})",

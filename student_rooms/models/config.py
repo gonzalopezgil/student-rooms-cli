@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 @dataclass
@@ -21,11 +21,8 @@ class FilterConfig:
 
 @dataclass
 class Semester1Rules:
-    # Strict keyword match for Semester 1 only by default
     name_keywords: List[str] = field(default_factory=lambda: ["semester 1"])
     require_keyword: bool = True
-
-    # Optional date-shape constraints for Semester 1 windows
     start_months: List[int] = field(default_factory=lambda: [9, 10])
     end_months: List[int] = field(default_factory=lambda: [1, 2])
     enforce_month_window: bool = True
@@ -62,14 +59,38 @@ class PollingConfig:
     jitter_seconds: int = 30
 
 
+# ---------------------------------------------------------------------------
+# Notifier configs
+# ---------------------------------------------------------------------------
+
 @dataclass
-class OpenClawConfig:
+class StdoutNotifierConfig:
+    enabled: bool = True
+
+
+@dataclass
+class WebhookNotifierConfig:
+    enabled: bool = False
+    url: Optional[str] = None
+    method: str = "POST"
+    headers: Dict[str, str] = field(default_factory=dict)
+    body_template: Optional[str] = None  # Use {message} placeholder
+
+
+@dataclass
+class TelegramNotifierConfig:
+    enabled: bool = False
+    bot_token: Optional[str] = None
+    chat_id: Optional[str] = None
+    parse_mode: Optional[str] = None  # "HTML" | "Markdown" | None
+
+
+@dataclass
+class OpenClawNotifierConfig:
     enabled: bool = False
     mode: str = "message"  # message | agent
     channel: str = "telegram"
     target: Optional[str] = None
-
-    # If true, create an immediate cron job for reservation assist/autobook
     create_job_on_match: bool = False
     reservation_mode: str = "assist"  # assist | autobook
     job_model: str = "anthropic/claude-sonnet-4-6"
@@ -80,7 +101,12 @@ class OpenClawConfig:
 
 @dataclass
 class NotificationConfig:
-    openclaw: OpenClawConfig = field(default_factory=OpenClawConfig)
+    # Which notifier to use: stdout | webhook | telegram | openclaw
+    type: str = "stdout"
+    stdout: StdoutNotifierConfig = field(default_factory=StdoutNotifierConfig)
+    webhook: WebhookNotifierConfig = field(default_factory=WebhookNotifierConfig)
+    telegram: TelegramNotifierConfig = field(default_factory=TelegramNotifierConfig)
+    openclaw: OpenClawNotifierConfig = field(default_factory=OpenClawNotifierConfig)
 
 
 @dataclass
@@ -93,7 +119,11 @@ class Config:
     providers: ProvidersConfig = field(default_factory=ProvidersConfig)
 
 
-def _get_dict(data, key, default=None):
+# ---------------------------------------------------------------------------
+# Config loading
+# ---------------------------------------------------------------------------
+
+def _get_dict(data: dict, key: str, default: Optional[dict] = None) -> dict:
     value = data.get(key)
     if value is None:
         return default or {}
@@ -102,7 +132,7 @@ def _get_dict(data, key, default=None):
     return default or {}
 
 
-def _as_int_list(value, fallback):
+def _as_int_list(value: Any, fallback: List[int]) -> List[int]:
     if not isinstance(value, list):
         return fallback
     out = []
@@ -115,9 +145,9 @@ def _as_int_list(value, fallback):
 
 
 def _load_yaml(path: str) -> Tuple[dict, List[str]]:
-    warnings = []
+    warnings: List[str] = []
     if not os.path.exists(path):
-        warnings.append(f"config.yaml not found at {path}; using defaults.")
+        warnings.append(f"Config file not found at {path}; using defaults.")
         return {}, warnings
     try:
         import yaml  # type: ignore
@@ -129,15 +159,13 @@ def _load_yaml(path: str) -> Tuple[dict, List[str]]:
         data = yaml.safe_load(handle) or {}
 
     if not isinstance(data, dict):
-        warnings.append("config.yaml root must be a mapping; using defaults.")
+        warnings.append("Config root must be a mapping; using defaults.")
         return {}, warnings
     return data, warnings
 
 
-def load_config(yaml_path: str = "config.yaml", ini_path: Optional[str] = None) -> Tuple[Config, List[str]]:
+def load_config(yaml_path: str = "config.yaml") -> Tuple[Config, List[str]]:
     data, warnings = _load_yaml(yaml_path)
-    if ini_path:
-        warnings.append("config.ini compatibility path is deprecated and ignored (Pushover removed).")
 
     target_data = _get_dict(data, "target", {})
     filter_data = _get_dict(data, "filters", {})
@@ -145,15 +173,29 @@ def load_config(yaml_path: str = "config.yaml", ini_path: Optional[str] = None) 
     semester_data = _get_dict(academic_data, "semester1", {})
     polling_data = _get_dict(data, "polling", {})
     notify_data = _get_dict(data, "notifications", {})
-    openclaw_data = _get_dict(notify_data, "openclaw", {})
     providers_data = _get_dict(data, "providers", {})
+
+    # Parse notifier configs
+    notify_type = str(notify_data.get("type", "stdout"))
+
+    # Webhook config
+    webhook_data = _get_dict(notify_data, "webhook", {})
+    webhook_headers = webhook_data.get("headers", {})
+    if not isinstance(webhook_headers, dict):
+        webhook_headers = {}
+
+    # Telegram config
+    telegram_data = _get_dict(notify_data, "telegram", {})
+
+    # OpenClaw config
+    openclaw_data = _get_dict(notify_data, "openclaw", {})
 
     config = Config(
         target=TargetConfig(
             country=target_data.get("country"),
             city=target_data.get("city"),
-            country_id=target_data.get("country_id"),
-            city_id=target_data.get("city_id"),
+            country_id=str(target_data["country_id"]) if target_data.get("country_id") is not None else None,
+            city_id=str(target_data["city_id"]) if target_data.get("city_id") is not None else None,
         ),
         filters=FilterConfig(
             private_bathroom=filter_data.get("private_bathroom"),
@@ -179,18 +221,33 @@ def load_config(yaml_path: str = "config.yaml", ini_path: Optional[str] = None) 
             jitter_seconds=int(polling_data.get("jitter_seconds", 30)),
         ),
         notifications=NotificationConfig(
-            openclaw=OpenClawConfig(
+            type=notify_type,
+            stdout=StdoutNotifierConfig(enabled=True),
+            webhook=WebhookNotifierConfig(
+                enabled=bool(webhook_data.get("enabled", False)),
+                url=webhook_data.get("url"),
+                method=str(webhook_data.get("method", "POST")),
+                headers=webhook_headers,
+                body_template=webhook_data.get("body_template"),
+            ),
+            telegram=TelegramNotifierConfig(
+                enabled=bool(telegram_data.get("enabled", False)),
+                bot_token=telegram_data.get("bot_token"),
+                chat_id=str(telegram_data["chat_id"]) if telegram_data.get("chat_id") is not None else None,
+                parse_mode=telegram_data.get("parse_mode"),
+            ),
+            openclaw=OpenClawNotifierConfig(
                 enabled=bool(openclaw_data.get("enabled", False)),
                 mode=str(openclaw_data.get("mode", "message")),
                 channel=str(openclaw_data.get("channel", "telegram")),
-                target=openclaw_data.get("target"),
+                target=str(openclaw_data["target"]) if openclaw_data.get("target") is not None else None,
                 create_job_on_match=bool(openclaw_data.get("create_job_on_match", False)),
                 reservation_mode=str(openclaw_data.get("reservation_mode", "assist")),
                 job_model=str(openclaw_data.get("job_model", "anthropic/claude-sonnet-4-6")),
                 job_timeout_seconds=int(openclaw_data.get("job_timeout_seconds", 600)),
                 job_channel=openclaw_data.get("job_channel"),
-                job_target=openclaw_data.get("job_target"),
-            )
+                job_target=str(openclaw_data["job_target"]) if openclaw_data.get("job_target") is not None else None,
+            ),
         ),
         providers=ProvidersConfig(
             yugo_enabled=bool(_get_dict(providers_data, "yugo", {}).get("enabled", True)),

@@ -243,33 +243,56 @@ class YugoProvider(BaseProvider):
         return True
 
     def _is_semester1_option(self, option: Dict[str, Any]) -> bool:
-        """Check name/label and date shape for Semester 1."""
+        """
+        Check if a tenancy option is Semester 1.
+        
+        Detection methods (any match = True):
+        1. Name/label contains "semester 1" keyword
+        2. Short duration (~20 weeks) with Sep-Oct start and Jan-Feb end
+        """
         label = " ".join([
             str(option.get("name", "")),
             str(option.get("formattedLabel", "")),
         ]).lower()
-        if "semester 1" not in label:
-            return False
-
+        
+        SEMESTER1_KEYWORDS = ["semester 1", "sem 1", "first semester", "semester1"]
+        has_keyword = any(kw in label for kw in SEMESTER1_KEYWORDS)
+        
         start_date = option.get("startDate", "")
         end_date = option.get("endDate", "")
+        
+        start_dt = None
+        end_dt = None
         if start_date:
             try:
                 from datetime import datetime as dt
-                s = dt.strptime(start_date, "%Y-%m-%d")
-                if s.month not in (9, 10):
-                    return False
+                start_dt = dt.strptime(start_date, "%Y-%m-%d")
             except ValueError:
                 pass
         if end_date:
             try:
                 from datetime import datetime as dt
-                e = dt.strptime(end_date, "%Y-%m-%d")
-                if e.month not in (1, 2):
-                    return False
+                end_dt = dt.strptime(end_date, "%Y-%m-%d")
             except ValueError:
                 pass
-        return True
+        
+        # Method 1: Keyword match + date validation
+        if has_keyword:
+            if start_dt and start_dt.month not in (8, 9, 10):
+                return False
+            if end_dt and end_dt.month not in (12, 1, 2):
+                return False
+            return True
+        
+        # Method 2: Duration-based detection (no keyword needed)
+        if start_dt and end_dt:
+            duration_weeks = (end_dt - start_dt).days / 7
+            if (duration_weeks <= 25 and
+                start_dt.month in (8, 9, 10) and
+                end_dt.month in (12, 1, 2)):
+                return True
+        
+        return False
 
     def scan(
         self,

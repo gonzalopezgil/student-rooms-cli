@@ -1,42 +1,64 @@
-# dublin-rooms
+# dublin-rooms 🏠
 
-**Multi-provider Dublin student accommodation CLI.**
-
-Monitors Yugo and Aparto properties for Semester 1 availability (Sept–Jan 2026-27 academic year).
-Sends Telegram alerts via OpenClaw for any new matching options detected.
-
-Built for: Álvaro López Gil — Erasmus Dublin 2026-27, Semester 1.
+CLI tool to monitor student accommodation availability in Dublin for **Semester 1 2026-2027** (September → January/February). Built for Álvaro's Erasmus.
 
 ## Providers
 
-| Provider | Source | Method |
-|---|---|---|
-| **Yugo** | `yugo.com` JSON API | REST API (no auth needed) |
-| **Aparto** | `apartostudent.com` HTML + StarRez portal | Web scraping (BeautifulSoup) |
+| Provider | Properties | Method |
+|----------|-----------|--------|
+| **Aparto** (apartostudent.com) | Binary Hub, Beckett House, Dorset Point, Montrose, The Loom, Stephen's Quarter | StarRez portal termID probing + main site scraping |
+| **Yugo** (yugo.com) | Dominick Place, Ardcairn House, Highfield Park, Brewers Close, The Tannery, New Mill, Broadstone Hall, Kavanagh Court | REST API |
 
-## Dublin Properties
+## Current State (February 2026)
 
-### Yugo
-Auto-discovered via API (country: Ireland → city: Dublin).
+- **Aparto**: Full-year (41 weeks) available for all 5 Dublin properties. No Semester 1 yet.
+- **Yugo**: Full-year (41 weeks) and 51 weeks available. No Semester 1 yet.
+- This is **expected** — semester options typically appear later in the year.
 
-### Aparto
-| Property | Location |
-|---|---|
-| Binary Hub | Bonham St, Dublin 8 |
-| Beckett House | Pearse St, Dublin 2 |
-| Dorset Point | Dorset St, Dublin 1 |
-| Montrose | Stillorgan Rd (near UCD) |
-| The Loom | Dublin |
-| Stephen's Quarter | Dublin 2 |
-
-## Installation
+## Commands
 
 ```bash
-cd yugo-scraper
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+# List all Dublin properties
+python cli.py discover --provider all
+
+# Scan for Semester 1 availability (filtered)
+python cli.py scan --provider all
+
+# Scan ALL options (including full-year)
+python cli.py scan --provider all --all-options --json
+
+# Continuous monitoring (every hour, Telegram alerts)
+python cli.py watch --provider all
+
+# Deep probe a specific option
+python cli.py probe-booking --provider aparto --residence "Binary Hub"
+
+# Send test notification
+python cli.py notify --message "Test notification"
 ```
+
+## How It Works
+
+### Aparto (StarRez Portal)
+1. Navigates the EU portal → selects Ireland → establishes session
+2. Probes a range of **termIDs** (1250-1350) via direct room search URLs
+3. Each valid termID returns term name, property, date range, and room availability
+4. Detects Semester 1 by:
+   - Name keywords: "semester 1", "sem 1", etc.
+   - Duration ≤ 25 weeks with start in Aug/Sep/Oct and end in Dec/Jan/Feb
+5. Enriches with pricing data from apartostudent.com property pages
+
+### Yugo (REST API)
+1. Lists residences for Dublin (city_id=598808)
+2. For each residence, fetches room types and tenancy options
+3. Checks academic year 2026-2027 tenancy groups
+4. Detects Semester 1 by name keywords or short duration with correct dates
+
+### Watch Mode
+- Scans both providers every hour (configurable)
+- Deduplicates: only alerts on **new** options not previously seen
+- Sends Telegram notification via OpenClaw when Semester 1 appears
+- Seen options persisted in `reports/seen_options.json`
 
 ## Configuration
 
@@ -49,130 +71,64 @@ providers:
   aparto:
     enabled: true
 
+target:
+  country: "Ireland"
+  city: "Dublin"
+  country_id: "598930"
+  city_id: "598808"
+
+polling:
+  interval_seconds: 3600    # 1 hour
+  jitter_seconds: 300       # 5 min random jitter
+
 notifications:
   openclaw:
-    enabled: true        # set to true to get Telegram alerts
+    enabled: true
     channel: "telegram"
-    target: "1473631236" # Gonzalo's Telegram ID
+    target: "1473631236"
 ```
 
-## Usage
+## Setup
 
 ```bash
-python main.py --help
+# Create venv and install deps
+python3 -m venv .venv
+source .venv/bin/activate
+pip install requests beautifulsoup4 pyyaml
+
+# Run tests
+python -m pytest tests/ -v
+
+# Quick scan
+python cli.py scan --provider all --all-options
 ```
 
-### Discover properties
-
-```bash
-# All providers
-python main.py discover
-
-# Specific provider
-python main.py discover --provider yugo
-python main.py discover --provider aparto
-
-# JSON output
-python main.py discover --json
-```
-
-### Single scan (Semester 1 filter)
-
-```bash
-# All providers
-python main.py scan
-
-# Yugo only
-python main.py scan --provider yugo
-
-# Aparto only
-python main.py scan --provider aparto
-
-# Skip semester filter (debug all options)
-python main.py scan --all-options --json
-
-# Scan and notify if match found
-python main.py scan --notify
-```
-
-### Watch loop (continuous monitoring)
-
-```bash
-# Monitor all providers, alert on new options
-python main.py watch
-
-# Monitor only Aparto
-python main.py watch --provider aparto
-```
-
-The watcher:
-- Polls every 60s (±15s jitter)
-- Deduplicates: won't alert twice for the same option
-- Persists seen options to `reports/seen_options.json` (survives restarts)
-- Sends Telegram alert for any new Semester 1 option detected
-
-### Deep booking probe
-
-```bash
-# Probe all providers
-python main.py probe-booking --json
-
-# Probe Yugo specifically (generates booking links)
-python main.py probe-booking --provider yugo --json
-
-# Probe Aparto (navigates StarRez portal)
-python main.py probe-booking --provider aparto --json
-
-# Filter by property/room
-python main.py probe-booking --residence "Binary Hub" --json
-```
-
-### Test notification
-
-```bash
-python main.py notify --message "Test alert 🏠"
-```
-
-### Test semester matching (Yugo legacy)
-
-```bash
-python main.py test-match --from-year 2026 --to-year 2027 \
-  --start-date 2026-09-01 --end-date 2027-01-31
-```
-
-## Dedup / Seen Options
-
-The watcher writes `reports/seen_options.json` after each cycle. Delete this file to re-alert on already-seen options.
-
-## Alert Format
+## Architecture
 
 ```
-🚨 NUEVO · Dublin Rooms · Semester 1 detectado
-
-⭐ Opción prioritaria:
-🏠 Binary Hub (APARTO)
-🛏 Gold Ensuite
-💶 €320/week
-📍 Bonham St, Dublin 8
-🔗 https://portal.apartostudent.com/...
-
-📋 3 opciones totales (top 5 alternativas):
-  2. [YUGO] Dominick Street | Standard Ensuite | €310/week
+cli.py                 # Entry point, argument parsing, watch loop
+config.yaml            # Configuration
+matching.py            # Semester 1 matching logic (Yugo format)
+notifier.py            # Telegram notifications via OpenClaw
+models/
+  config.py            # Config dataclasses
+providers/
+  base.py              # BaseProvider + RoomOption dataclass
+  aparto.py            # Aparto: StarRez termID probing
+  yugo.py              # Yugo: REST API client
+tests/
+  test_aparto.py       # 26 tests
+  test_matching.py     # 4 tests
+reports/
+  seen_options.json    # Dedup persistence for watch mode
 ```
 
-## Notes for Agents
+## Known TermIDs (Aparto, Feb 2026)
 
-- **Yugo**: Use `probe-booking --provider yugo --json` to get `skipRoomLink`/`handoverLink` for direct browser handoff
-- **Aparto**: Use `probe-booking --provider aparto --json` to get StarRez portal status + entry URL
-- Once a match is found, navigate to the booking URL in browser and complete the form
-- Do NOT attempt irreversible payment actions automatically
-
-## Docs
-
-- `TASK.md` — original refactoring spec
-- `APARTO_RESEARCH.md` — Aparto site architecture research
-- `BOOKING_AUTOMATION_ANALYSIS.md` — booking flow analysis
-
-## License
-
-MIT
+| termID | Term | Dates |
+|--------|------|-------|
+| 1264 | Dorset Point - 26/27 - 41 Weeks | 26/08/2026 → 09/06/2027 |
+| 1265 | Beckett House - 26/27 - 41 Weeks | 26/08/2026 → 09/06/2027 |
+| 1266 | The Loom - 26/27 - 41 weeks | 26/08/2026 → 09/06/2027 |
+| 1267 | Binary Hub - 26/27 - 41 Weeks | 29/08/2026 → 12/06/2027 |
+| 1268 | Montrose - 26/27 - 41 weeks | 29/08/2026 → 12/06/2027 |

@@ -1,15 +1,15 @@
 """
 providers/aparto.py — Aparto accommodation provider (apartostudent.com).
 
-Scraping strategy (two-tier):
-  1. Main site HTML scraping (lightweight monitor):
-     - Fetches each Dublin property page
-     - Parses room types (Bronze/Silver/Gold/Platinum Ensuite) + prices
-     - Parses __NEXT_DATA__ JSON if available
-     - Used for `discover` and as a lightweight `scan`
-  2. StarRez portal probe (deeper check):
-     - Navigates portal.apartostudent.com to check real Semester 1 availability
-     - Used for `probe-booking`
+Scraping strategy (StarRez termID probing):
+  1. Navigate EU portal → select Ireland → get session cookies
+  2. Probe a range of termIDs via direct room search URLs
+  3. Each valid termID returns a "Choose your room" page with:
+     - Term name (e.g. "Binary Hub - 26/27 - 41 Weeks")
+     - Date range (start/end dates)
+     - Room availability data
+  4. Detect Semester 1 by analyzing term names and date ranges
+  5. Cache known termIDs to detect NEW ones between scans
 """
 from __future__ import annotations
 
@@ -17,7 +17,9 @@ import json
 import logging
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
+from dataclasses import dataclass, field
+from datetime import datetime
 
 import requests
 from bs4 import BeautifulSoup
@@ -31,30 +33,42 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 MAIN_BASE = "https://apartostudent.com"
-PORTAL_BASE = "https://portal.apartostudent.com/StarRezPortalXEU"
+PORTAL_EU_BASE = "https://portal.apartostudent.com/StarRezPortalXEU"
+PORTAL_IE_BASE = "https://apartostudent.starrezhousing.com/StarRezPortal"
 
 # Dublin properties: slug → display name + location
 DUBLIN_PROPERTIES: List[Dict[str, str]] = [
     {"slug": "binary-hub",       "name": "Binary Hub",         "location": "Bonham St, Dublin 8"},
-    {"slug": "beckett-house",    "name": "Beckett House",       "location": "Pearse St, Dublin 2"},
-    {"slug": "dorset-point",     "name": "Dorset Point",        "location": "Dorset St, Dublin 1"},
-    {"slug": "montrose",         "name": "Montrose",            "location": "Stillorgan Rd (near UCD)"},
-    {"slug": "the-loom",         "name": "The Loom",            "location": "Dublin"},
-    {"slug": "stephens-quarter", "name": "Stephen's Quarter",   "location": "Dublin 2"},
+    {"slug": "beckett-house",    "name": "Beckett House",      "location": "Pearse St, Dublin 2"},
+    {"slug": "dorset-point",     "name": "Dorset Point",       "location": "Dorset St, Dublin 1"},
+    {"slug": "montrose",         "name": "Montrose",           "location": "Stillorgan Rd (near UCD)"},
+    {"slug": "the-loom",         "name": "The Loom",           "location": "Mill St, Dublin 8"},
+    {"slug": "stephens-quarter", "name": "Stephen's Quarter",  "location": "Earlsfort Tce, Dublin 2"},
 ]
+
+# Dublin property names for matching (lowercase)
+DUBLIN_PROPERTY_NAMES = {p["name"].lower() for p in DUBLIN_PROPERTIES}
+
+# Known termIDs for Dublin properties (26/27, full year)
+KNOWN_DUBLIN_TERM_IDS = {
+    1264: "Dorset Point - 26/27 - 41 Weeks",
+    1265: "Beckett House - 26/27 - 41 Weeks",
+    1266: "The Loom - 26/27 - 41 weeks",
+    1267: "Binary Hub - 26/27 - 41 Weeks",
+    1268: "Montrose - 26/27 - 41 weeks",
+}
+
+# TermID scan range for detecting new terms
+# Current known range: 1258-1284 (Feb 2026)
+# Scan wider to catch new additions
+TERM_ID_SCAN_START = 1250
+TERM_ID_SCAN_END = 1350
 
 # StarRez Ireland booking entry point
 STARREZ_ENTRY_URL = (
-    f"{PORTAL_BASE}/F33813C2/65/1556/"
+    f"{PORTAL_EU_BASE}/F33813C2/65/1556/"
     "Book_a_room-Choose_Your_Country?UrlToken=8E2FC74D"
 )
-STARREZ_COUNTRY_VALUE = "1"   # Ireland
-
-# Academic year format used in Aparto URLs / portal
-ACADEMIC_YEAR_FORMAT = {
-    "2026-27": "01-08-2026_04-09-2027",
-    "2025-26": "01-08-2025_04-09-2026",
-}
 
 HEADERS = {
     "User-Agent": (
@@ -65,8 +79,35 @@ HEADERS = {
     "Accept-Language": "en-IE,en;q=0.9",
 }
 
+# Semester 1 detection
+SEMESTER1_KEYWORDS = ["semester 1", "sem 1", "semester1", "first semester"]
+SEMESTER1_MAX_WEEKS = 25
+FULL_YEAR_MIN_WEEKS = 35
+
+
 # ---------------------------------------------------------------------------
-# HTML / JSON parsing helpers
+# Data models
+# ---------------------------------------------------------------------------
+
+@dataclass
+class StarRezTerm:
+    """A booking term discovered via termID probing."""
+    term_id: int
+    term_name: str          # e.g. "Binary Hub - 26/27 - 41 Weeks"
+    property_name: str      # e.g. "Binary Hub"
+    start_date: Optional[str]  # DD/MM/YYYY format
+    end_date: Optional[str]
+    start_iso: Optional[str]   # YYYY-MM-DD from data attributes
+    end_iso: Optional[str]
+    weeks: Optional[int]
+    is_dublin: bool
+    is_semester1: bool
+    has_rooms: bool
+    booking_url: str
+
+
+# ---------------------------------------------------------------------------
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _fetch(
@@ -112,13 +153,11 @@ def _extract_rsc_json_chunks(html: str) -> List[Any]:
     pattern = re.compile(r'self\.__next_f\.push\(\[1\s*,\s*"((?:[^"\\]|\\.)*)"\]\)', re.DOTALL)
     for match in pattern.finditer(html):
         raw = match.group(1)
-        # Un-escape the JSON string
         try:
             unescaped = raw.encode("utf-8").decode("unicode_escape")
         except Exception:
             unescaped = raw.replace('\\"', '"').replace("\\n", "\n")
         try:
-            # RSC chunks contain lines like "0:{...}" or "1:..." – try to parse JSON objects
             for line in unescaped.splitlines():
                 colon_idx = line.find(":")
                 if colon_idx < 0:
@@ -135,31 +174,15 @@ def _extract_rsc_json_chunks(html: str) -> List[Any]:
 
 
 def _extract_prices_from_html(html: str, property_name: str) -> List[Dict[str, Any]]:
-    """
-    Parse room types and prices directly from HTML.
-    Looks for patterns like:
-      - "Bronze Ensuite" / "Silver Ensuite" / "Gold Ensuite" / "Platinum Ensuite"
-      - "€291 p/w" / "€291/week" / "from €291"
-    Returns a list of {room_type, price_label, price_weekly}.
-
-    Strategy:
-    1. Find tier+subtype combinations that appear close to a price
-    2. Fall back to separate tier list + price list if proximity fails
-    """
+    """Parse room types and prices from HTML."""
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(separator=" ")
 
-    # Aparto-specific tiers (ordered by tier level)
     APARTO_TIERS = ["Bronze", "Silver", "Gold", "Platinum"]
-    GENERIC_TIERS = ["Studio", "Deluxe", "Premium", "Classic", "Standard"]
 
-    price_pattern = re.compile(r'€\s*(\d+(?:[.,]\d+)?)\s*(?:p/?w|/week|per week|pw)', re.IGNORECASE)
-
-    # --- Strategy 1: proximity matching (tier string near a price) ---
     rooms = []
     seen_tiers: set = set()
 
-    # Look for "Tier [Subtype]... €NNN" within ~200 chars
     proximity_pattern = re.compile(
         r'(Bronze|Silver|Gold|Platinum|Studio|Deluxe)[\s\-]*(Ensuite|En-suite|Studio|Room|Suite|Apartment)?'
         r'.{0,200}?€\s*(\d+(?:[.,]\d+)?)\s*(?:p/?w|/week|per week|pw)',
@@ -183,12 +206,11 @@ def _extract_prices_from_html(html: str, property_name: str) -> List[Dict[str, A
         })
 
     if rooms:
-        # Sort by Aparto tier order
-        tier_order = {t: i for i, t in enumerate(APARTO_TIERS + GENERIC_TIERS)}
+        tier_order = {t: i for i, t in enumerate(APARTO_TIERS)}
         rooms.sort(key=lambda r: tier_order.get(r["room_type"].split()[0].title(), 99))
         return rooms
 
-    # --- Strategy 2: separate tier list + price list ---
+    # Fallback: separate tier list + price list
     tier_pattern = re.compile(
         r'\b(Bronze|Silver|Gold|Platinum|Studio|Deluxe)\b'
         r'[\s\-]*(Ensuite|En-suite|Room|Suite|Apartment)?',
@@ -202,15 +224,9 @@ def _extract_prices_from_html(html: str, property_name: str) -> List[Dict[str, A
         if label not in found_tiers:
             found_tiers.append(label)
 
+    price_pattern = re.compile(r'€\s*(\d+(?:[.,]\d+)?)\s*(?:p/?w|/week|per week|pw)', re.IGNORECASE)
     prices_raw = price_pattern.findall(text)
-    prices = []
-    for p in prices_raw:
-        try:
-            prices.append(float(p.replace(",", ".")))
-        except ValueError:
-            pass
-    # deduplicate and sort
-    prices = sorted(set(prices))
+    prices = sorted({float(p.replace(",", ".")) for p in prices_raw if p})
 
     if not found_tiers:
         weekly = prices[0] if prices else None
@@ -220,8 +236,7 @@ def _extract_prices_from_html(html: str, property_name: str) -> List[Dict[str, A
             "price_weekly": weekly,
         }]
 
-    # Match each tier to a price by index
-    tier_order = {t: i for i, t in enumerate(APARTO_TIERS + GENERIC_TIERS)}
+    tier_order = {t: i for i, t in enumerate(APARTO_TIERS)}
     found_tiers.sort(key=lambda l: tier_order.get(l.split()[0].title(), 99))
 
     for idx, tier_label in enumerate(found_tiers):
@@ -236,18 +251,13 @@ def _extract_prices_from_html(html: str, property_name: str) -> List[Dict[str, A
 
 
 def _extract_rooms_from_next_data(next_data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Attempt to extract room data from __NEXT_DATA__.
-    The shape varies by Next.js version; this is best-effort.
-    """
+    """Attempt to extract room data from __NEXT_DATA__."""
     rooms = []
     try:
-        # Walk all nested dicts looking for room-like structures
         def _walk(obj: Any, depth: int = 0):
             if depth > 10:
                 return
             if isinstance(obj, dict):
-                # Look for price + room type keys
                 name = obj.get("name") or obj.get("title") or obj.get("roomType") or ""
                 price = obj.get("price") or obj.get("priceFrom") or obj.get("weeklyPrice") or 0
                 if name and price and any(
@@ -269,7 +279,6 @@ def _extract_rooms_from_next_data(next_data: Dict[str, Any]) -> List[Dict[str, A
             elif isinstance(obj, list):
                 for item in obj:
                     _walk(item, depth + 1)
-
         _walk(next_data)
     except Exception as exc:
         logger.debug("next_data room extraction error: %s", exc)
@@ -277,153 +286,272 @@ def _extract_rooms_from_next_data(next_data: Dict[str, Any]) -> List[Dict[str, A
 
 
 # ---------------------------------------------------------------------------
-# StarRez portal scraper
+# Term analysis
+# ---------------------------------------------------------------------------
+
+def _parse_weeks_from_name(term_name: str) -> Optional[int]:
+    """Extract week count from term name like 'Binary Hub - 26/27 - 41 Weeks'."""
+    m = re.search(r'(\d+)\s*[Ww]eek', term_name)
+    return int(m.group(1)) if m else None
+
+
+def _extract_property_name(term_name: str) -> str:
+    """Extract property name from term name like 'Binary Hub - 26/27 - 41 Weeks'."""
+    if " - " in term_name:
+        return term_name.split(" - ")[0].strip()
+    return term_name
+
+
+def _is_dublin_term(term_name: str) -> bool:
+    """Check if a term belongs to a Dublin property."""
+    prop_name = _extract_property_name(term_name).lower()
+    return any(dp in prop_name or prop_name in dp for dp in DUBLIN_PROPERTY_NAMES)
+
+
+def _is_semester1_term(
+    term_name: str,
+    start_date: Optional[str],
+    end_date: Optional[str],
+    weeks: Optional[int],
+) -> bool:
+    """
+    Detect if a term is a Semester 1 option.
+
+    Checks:
+    1. Name contains semester 1 keywords
+    2. Duration is <= 25 weeks (not full year)
+    3. Start date is August/September/October
+    4. End date is December/January/February
+    """
+    name_lower = term_name.lower()
+
+    # Direct keyword match
+    if any(kw in name_lower for kw in SEMESTER1_KEYWORDS):
+        return True
+
+    # Duration-based detection
+    if weeks is not None and weeks <= SEMESTER1_MAX_WEEKS:
+        if start_date and end_date:
+            try:
+                s = datetime.strptime(start_date, "%d/%m/%Y")
+                e = datetime.strptime(end_date, "%d/%m/%Y")
+                if s.month in (8, 9, 10) and e.month in (12, 1, 2):
+                    return True
+            except ValueError:
+                pass
+
+    # ISO date format fallback
+    if start_date and end_date and "-" in start_date:
+        try:
+            s = datetime.strptime(start_date, "%Y-%m-%d")
+            e = datetime.strptime(end_date, "%Y-%m-%d")
+            duration_weeks = (e - s).days / 7
+            if (duration_weeks <= SEMESTER1_MAX_WEEKS and
+                s.month in (8, 9, 10) and
+                e.month in (12, 1, 2)):
+                return True
+        except ValueError:
+            pass
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# StarRez portal session & term probing
 # ---------------------------------------------------------------------------
 
 class StarRezScraper:
     """
-    Navigate the StarRez Aparto portal to check real Semester 1 availability.
-    Uses session-based HTML form navigation (no REST API).
+    Navigate the StarRez Aparto portal and probe termIDs.
+
+    Strategy:
+    1. Establish session by navigating EU portal → Ireland
+    2. Probe termIDs by directly accessing room search redirect URLs
+    3. Parse term info from each valid response page
     """
 
     def __init__(self, session: requests.Session):
         self.session = session
+        self._session_established = False
 
-    def _post_form(self, url: str, data: Dict[str, Any], timeout: int = 20) -> Optional[str]:
-        """Post form and follow any redirect.
-        
-        StarRez sometimes returns a quoted URL string as the response body
-        (AJAX-style redirect) instead of HTML. We detect and follow it.
-        """
+    def _establish_session(self) -> bool:
+        """Navigate EU portal → Ireland to establish session cookies."""
+        if self._session_established:
+            return True
+
         try:
-            resp = self.session.post(url, data=data, headers=HEADERS, timeout=timeout)
-            if resp.status_code != 200:
-                logger.warning("StarRez POST %s → HTTP %s", url, resp.status_code)
-                return None
+            r1 = self.session.get(STARREZ_ENTRY_URL, headers=HEADERS, timeout=20)
+            if r1.status_code != 200:
+                logger.warning("StarRez entry page HTTP %d", r1.status_code)
+                return False
 
-            body = resp.text.strip()
+            soup = BeautifulSoup(r1.text, "html.parser")
+            form = soup.find("form")
+            if not form:
+                logger.warning("No form on StarRez entry page")
+                return False
 
-            # Check if response is a quoted redirect URL (e.g. "/StarRezPortalXEU/...")
-            if body.startswith('"') and body.endswith('"') and "/StarRez" in body:
-                redirect_path = body.strip('"')
-                if redirect_path.startswith("/StarRezPortalXEU"):
-                    redirect_url = f"https://portal.apartostudent.com{redirect_path}"
-                elif redirect_path.startswith("/"):
-                    redirect_url = f"{PORTAL_BASE}{redirect_path}"
-                else:
-                    redirect_url = f"{PORTAL_BASE}/{redirect_path}"
-                logger.info("StarRez redirect → %s", redirect_url)
-                follow_resp = self.session.get(redirect_url, headers=HEADERS, timeout=timeout)
-                if follow_resp.status_code == 200:
-                    return follow_resp.text
-                logger.warning("StarRez redirect follow → HTTP %s", follow_resp.status_code)
-                return None
-
-            return body
-        except requests.RequestException as exc:
-            logger.warning("StarRez POST error: %s", exc)
-        return None
-
-    def _get_form_fields(self, html: str) -> Dict[str, str]:
-        """Extract hidden form fields (including CSRF tokens) from HTML."""
-        soup = BeautifulSoup(html, "html.parser")
-        fields: Dict[str, str] = {}
-        for inp in soup.find_all("input"):
-            name = inp.get("name")
-            value = inp.get("value", "")
-            if name:
-                fields[str(name)] = str(value)
-        return fields
-
-    def _get_action_url(self, html: str, base_url: str) -> str:
-        """Extract form action URL from HTML.
-        
-        StarRez form actions are typically relative to the portal root,
-        e.g. /F33813C2/65/... which maps to PORTAL_BASE + action.
-        """
-        soup = BeautifulSoup(html, "html.parser")
-        form = soup.find("form")
-        if form:
             action = form.get("action", "")
-            if action:
-                if action.startswith("http"):
-                    return action
-                if action.startswith("/"):
-                    return f"{PORTAL_BASE}{action}"
-                return f"{PORTAL_BASE}/{action}"
-        return base_url
+            fields: Dict[str, str] = {}
+            for inp in soup.find_all("input"):
+                name = inp.get("name")
+                if name:
+                    fields[name] = inp.get("value", "")
 
-    def check_semester1_availability(
-        self, academic_year: str = "2026-27"
-    ) -> Tuple[bool, List[Dict[str, Any]], str]:
+            select = soup.find("select")
+            if select:
+                fields[select.get("name", "CheckOrderList")] = "1"  # Ireland
+
+            post_url = f"https://portal.apartostudent.com/StarRezPortalXEU{action}"
+
+            time.sleep(0.3)
+            r2 = self.session.post(post_url, data=fields, headers=HEADERS, timeout=20, allow_redirects=False)
+            redirect_path = r2.text.strip().strip('"')
+            if not redirect_path or not redirect_path.startswith("/"):
+                logger.warning("Unexpected redirect response: %s", r2.text[:100])
+                return False
+
+            time.sleep(0.3)
+            r3 = self.session.get(
+                f"https://portal.apartostudent.com{redirect_path}",
+                headers=HEADERS,
+                timeout=20,
+                allow_redirects=True,
+            )
+            if r3.status_code != 200:
+                logger.warning("Residence page HTTP %d", r3.status_code)
+                return False
+
+            self._session_established = True
+            logger.info("StarRez session established: %s", r3.url)
+            return True
+
+        except requests.RequestException as exc:
+            logger.warning("StarRez session error: %s", exc)
+            return False
+
+    def probe_term(self, term_id: int) -> Optional[StarRezTerm]:
         """
-        Navigate StarRez portal to check if Semester 1 options are available.
-        Returns: (available, list_of_options, status_message)
+        Probe a single termID by accessing its room search redirect URL.
+        Returns StarRezTerm if valid, None if invalid/error.
         """
-        # Step 1: Load entry page
-        html = _fetch(self.session, STARREZ_ENTRY_URL, timeout=20)
-        if not html:
-            return False, [], "Could not reach StarRez portal"
+        url = (
+            f"{PORTAL_IE_BASE}/General/RoomSearch/RoomSearch/RedirectToMainFilter"
+            f"?roomSelectionModelID=361&filterID=1&option=RoomLocationArea&termID={term_id}"
+        )
+        try:
+            r = self.session.get(url, headers=HEADERS, timeout=15, allow_redirects=True)
+            if r.status_code != 200:
+                return None
+            if "Choose your room" not in r.text:
+                return None
+        except requests.RequestException:
+            return None
 
-        # Check if portal is open
-        if 'data-portalrulestatus="Open"' in html or "Choose_Your_Country" in html:
-            logger.info("StarRez portal appears to be open")
-        elif "Closed" in html or "closed" in html:
-            return False, [], "StarRez portal appears closed"
+        soup = BeautifulSoup(r.text, "html.parser")
 
-        fields = self._get_form_fields(html)
-        action_url = self._get_action_url(html, STARREZ_ENTRY_URL)
-
-        # Step 2: Submit country selection (Ireland = 1)
-        # Detect the actual select field name from HTML
-        soup_fields = BeautifulSoup(html, "html.parser")
-        select_el = soup_fields.find("select")
-        country_field_name = select_el.get("name") if select_el else None
-
-        if country_field_name:
-            fields[country_field_name] = STARREZ_COUNTRY_VALUE
-        else:
-            # Fallback: try common field names
-            for country_field in ["CheckOrderList", "DropDownCountry", "ddlCountry", "country", "CountryID"]:
-                fields[country_field] = STARREZ_COUNTRY_VALUE
-
-        time.sleep(1)
-        html2 = self._post_form(action_url, fields)
-        if not html2:
-            return False, [], "Failed to submit country selection"
-
-        # Step 3: Look for Semester 1 / academic year options in the response
-        soup = BeautifulSoup(html2, "html.parser")
-        page_text = soup.get_text(separator=" ")
-
-        academic_year_str = ACADEMIC_YEAR_FORMAT.get(academic_year, "")
-        found_semester1 = (
-            "Semester 1" in page_text
-            or "semester 1" in page_text.lower()
-            or (academic_year_str and academic_year_str in page_text)
+        # Extract term name + dates from info text
+        term_info_match = re.search(
+            r"You have selected '([^']+)' booking term.*?"
+            r"begins on (\d{2}/\d{2}/\d{4}).*?"
+            r"ends on (\d{2}/\d{2}/\d{4})",
+            r.text,
+            re.DOTALL,
         )
 
-        # Extract visible booking options
-        options = []
-        option_pattern = re.compile(
-            r'(Semester\s*1|Semester\s*2|Full\s*Year|Academic\s*Year)',
-            re.IGNORECASE,
+        # Get ISO dates from data attributes
+        page_container = soup.find(attrs={"data-termid": True})
+        start_iso = page_container.get("data-datestart", "")[:10] if page_container else None
+        end_iso = page_container.get("data-dateend", "")[:10] if page_container else None
+
+        term_name = term_info_match.group(1) if term_info_match else f"Term {term_id}"
+        start_date = term_info_match.group(2) if term_info_match else None
+        end_date = term_info_match.group(3) if term_info_match else None
+
+        property_name = _extract_property_name(term_name)
+        weeks = _parse_weeks_from_name(term_name)
+        is_dublin = _is_dublin_term(term_name)
+
+        # For Semester 1 detection, use DD/MM/YYYY if available, else ISO
+        is_sem1 = _is_semester1_term(
+            term_name,
+            start_date or start_iso,
+            end_date or end_iso,
+            weeks,
         )
-        price_pattern = re.compile(r'€\s*(\d+(?:[.,]\d+)?)', re.IGNORECASE)
 
-        for match in option_pattern.finditer(page_text):
-            label = match.group(0).strip()
-            # Try to find price near this option
-            nearby = page_text[max(0, match.start() - 50): match.end() + 100]
-            price_m = price_pattern.search(nearby)
-            weekly = float(price_m.group(1).replace(",", ".")) if price_m else None
-            options.append({
-                "label": label,
-                "price_weekly": weekly,
-            })
+        # Check for actual room listings
+        has_rooms = (
+            "room-result" in r.text.lower()
+            or "€" in soup.get_text()
+            or bool(soup.find(attrs={"data-roombaseid": True}))
+        )
 
-        status = "Semester 1 detected in portal" if found_semester1 else "No Semester 1 options visible"
-        return found_semester1, options, status
+        return StarRezTerm(
+            term_id=term_id,
+            term_name=term_name,
+            property_name=property_name,
+            start_date=start_date,
+            end_date=end_date,
+            start_iso=start_iso,
+            end_iso=end_iso,
+            weeks=weeks,
+            is_dublin=is_dublin,
+            is_semester1=is_sem1,
+            has_rooms=has_rooms,
+            booking_url=r.url,
+        )
+
+    def scan_term_range(
+        self,
+        start_id: int = TERM_ID_SCAN_START,
+        end_id: int = TERM_ID_SCAN_END,
+        dublin_only: bool = True,
+        delay: float = 0.35,
+    ) -> List[StarRezTerm]:
+        """
+        Scan a range of termIDs and return all valid terms.
+
+        This is the core monitoring function. By scanning termIDs periodically,
+        we can detect when new terms (e.g., Semester 1) are added.
+        """
+        if not self._establish_session():
+            logger.error("Failed to establish StarRez session")
+            return []
+
+        terms: List[StarRezTerm] = []
+        consecutive_misses = 0
+
+        for tid in range(start_id, end_id + 1):
+            term = self.probe_term(tid)
+            if term:
+                consecutive_misses = 0
+                if dublin_only and not term.is_dublin:
+                    continue
+                terms.append(term)
+                logger.debug(
+                    "Term %d: %s (%s → %s) dublin=%s sem1=%s",
+                    tid, term.term_name, term.start_date, term.end_date,
+                    term.is_dublin, term.is_semester1,
+                )
+            else:
+                consecutive_misses += 1
+                # Stop scanning if we hit too many consecutive misses
+                # (beyond the known range)
+                if consecutive_misses > 20 and tid > max(KNOWN_DUBLIN_TERM_IDS.keys()) + 30:
+                    logger.debug("Stopping scan at termID %d (20 consecutive misses)", tid)
+                    break
+
+            if delay > 0:
+                time.sleep(delay)
+
+        logger.info(
+            "StarRez scan complete: %d/%d termIDs checked, %d Dublin terms found",
+            min(end_id - start_id + 1, tid - start_id + 1),
+            end_id - start_id + 1,
+            len(terms),
+        )
+        return terms
 
 
 # ---------------------------------------------------------------------------
@@ -431,7 +559,7 @@ class StarRezScraper:
 # ---------------------------------------------------------------------------
 
 class ApartoProvider(BaseProvider):
-    """Aparto provider: scrapes apartostudent.com + StarRez portal."""
+    """Aparto provider: StarRez termID probing + main site price scraping."""
 
     def __init__(self):
         self._session = requests.Session()
@@ -441,7 +569,7 @@ class ApartoProvider(BaseProvider):
         return "aparto"
 
     def discover_properties(self) -> List[Dict[str, Any]]:
-        """Return static list of known Dublin properties (enriched if possible)."""
+        """Return static list of known Dublin properties."""
         props = []
         for prop in DUBLIN_PROPERTIES:
             url = f"{MAIN_BASE}/locations/dublin/{prop['slug']}"
@@ -455,10 +583,7 @@ class ApartoProvider(BaseProvider):
         return props
 
     def _scrape_property(self, prop: Dict[str, str]) -> List[Dict[str, Any]]:
-        """
-        Scrape a single property page and return room data.
-        Returns list of {room_type, price_label, price_weekly, property, ...}
-        """
+        """Scrape a single property page for room types + prices."""
         url = f"{MAIN_BASE}/locations/dublin/{prop['slug']}"
         html = _fetch(self._session, url)
         if not html:
@@ -467,18 +592,15 @@ class ApartoProvider(BaseProvider):
 
         rooms: List[Dict[str, Any]] = []
 
-        # Try __NEXT_DATA__ first (most structured)
         next_data = _extract_next_data(html)
         if next_data:
             next_rooms = _extract_rooms_from_next_data(next_data)
             if next_rooms:
                 rooms = next_rooms
 
-        # Fall back to HTML text parsing
         if not rooms:
             rooms = _extract_prices_from_html(html, prop["name"])
 
-        # Tag each room with property info
         for room in rooms:
             room.update({
                 "property_name": prop["name"],
@@ -496,87 +618,137 @@ class ApartoProvider(BaseProvider):
         apply_semester_filter: bool = True,
     ) -> List[RoomOption]:
         """
-        Scrape all Dublin properties and return RoomOption list.
-        NOTE: Main-site data shows pricing but not granular Semester 1 availability.
-        Use probe_booking() for StarRez-level confirmation.
+        Full scan: probe StarRez termIDs + scrape main site for prices.
+
+        Strategy:
+        1. Scan termIDs to find all Dublin booking terms
+        2. Filter for Semester 1 terms (or return all if filter is off)
+        3. Enrich with pricing data from the main site
         """
         results: List[RoomOption] = []
-        portal_available = False
-        portal_options: List[Dict] = []
-        portal_status = ""
 
-        # Quick StarRez check to see if Semester 1 is open
+        # Step 1: Probe StarRez termIDs
+        scraper = StarRezScraper(self._session)
+        all_terms = scraper.scan_term_range(dublin_only=True)
+        logger.info("Aparto: found %d Dublin terms", len(all_terms))
+
+        # Filter by academic year (26/27)
+        year_terms = [
+            t for t in all_terms
+            if "26/27" in t.term_name or (
+                t.start_iso and t.start_iso.startswith("2026") and
+                t.end_iso and (t.end_iso.startswith("2027") or t.end_iso.startswith("2026"))
+            )
+        ]
+
+        # Apply semester filter
         if apply_semester_filter and semester == 1:
-            try:
-                star_scraper = StarRezScraper(self._session)
-                portal_available, portal_options, portal_status = (
-                    star_scraper.check_semester1_availability(academic_year)
-                )
-                logger.info("StarRez status: %s", portal_status)
-            except Exception as exc:
-                logger.warning("StarRez probe error: %s", exc)
+            target_terms = [t for t in year_terms if t.is_semester1]
+        else:
+            target_terms = year_terms
 
+        if not target_terms:
+            sem1_count = sum(1 for t in year_terms if t.is_semester1)
+            logger.info(
+                "Aparto: %d year terms, %d Semester 1 terms (filter=%s)",
+                len(year_terms), sem1_count, apply_semester_filter,
+            )
+            if not apply_semester_filter:
+                target_terms = year_terms
+
+        if not target_terms:
+            return results
+
+        # Step 2: Get pricing data from main site
+        property_rooms: Dict[str, List[Dict]] = {}
+        prop_lookup = {p["name"].lower(): p for p in DUBLIN_PROPERTIES}
         for prop in DUBLIN_PROPERTIES:
-            time.sleep(0.5)  # polite delay between property pages
+            time.sleep(0.5)
             rooms = self._scrape_property(prop)
+            if rooms:
+                property_rooms[prop["slug"]] = rooms
+
+        # Step 3: Build RoomOptions
+        for term in target_terms:
+            prop_info = prop_lookup.get(term.property_name.lower())
+            if not prop_info:
+                for key, val in prop_lookup.items():
+                    if term.property_name.lower() in key or key in term.property_name.lower():
+                        prop_info = val
+                        break
+
+            slug = prop_info["slug"] if prop_info else term.property_name.lower().replace(" ", "-")
+            location = prop_info["location"] if prop_info else ""
+
+            rooms = property_rooms.get(slug, [])
             if not rooms:
-                continue
+                rooms = [{"room_type": "Room (type TBC)", "price_weekly": None, "price_label": "price TBC"}]
 
             for room in rooms:
-                weekly = room.get("price_weekly")
-                price_label = room.get("price_label") or ""
-
-                # For semester filtering: mark as available only if portal confirms it
-                # If we couldn't check the portal, still include (with available=False as a probe signal)
-                available = portal_available if apply_semester_filter else True
-
-                booking_url = STARREZ_ENTRY_URL  # Best direct link we have
-
                 results.append(RoomOption(
                     provider="aparto",
-                    property_name=room.get("property_name") or prop["name"],
-                    property_slug=prop["slug"],
-                    room_type=room.get("room_type") or "Room",
-                    price_weekly=weekly,
-                    price_label=price_label,
-                    available=available,
-                    booking_url=booking_url,
-                    start_date=None,  # StarRez portal has actual dates
-                    end_date=None,
+                    property_name=term.property_name,
+                    property_slug=slug,
+                    room_type=room.get("room_type", "Room"),
+                    price_weekly=room.get("price_weekly"),
+                    price_label=room.get("price_label", ""),
+                    available=True,
+                    booking_url=term.booking_url,
+                    start_date=term.start_iso,
+                    end_date=term.end_iso,
                     academic_year=academic_year,
-                    option_name=f"Semester 1 {academic_year}" if semester == 1 else academic_year,
-                    location=prop.get("location"),
+                    option_name=term.term_name,
+                    location=location,
                     raw={
-                        "page_url": room.get("page_url") or "",
-                        "portal_status": portal_status,
-                        "portal_available": portal_available,
-                        "portal_options": portal_options,
+                        "term_id": term.term_id,
+                        "weeks": term.weeks,
+                        "is_semester1": term.is_semester1,
+                        "start_date_dd": term.start_date,
+                        "end_date_dd": term.end_date,
                     },
                 ))
 
         return results
 
     def probe_booking(self, option: RoomOption) -> Dict[str, Any]:
-        """
-        Deep-probe StarRez portal for actual Semester 1 availability.
-        Returns booking context + direct portal link.
-        """
-        star_scraper = StarRezScraper(self._session)
-        academic_year = option.academic_year or "2026-27"
-        available, options, status = star_scraper.check_semester1_availability(academic_year)
+        """Deep-probe for a specific option."""
+        scraper = StarRezScraper(self._session)
+        all_terms = scraper.scan_term_range(dublin_only=True)
+
+        term_id = option.raw.get("term_id")
+        matching_term = None
+        if term_id:
+            matching_term = next((t for t in all_terms if t.term_id == term_id), None)
+
+        semester1_terms = [t for t in all_terms if t.is_semester1 and "26/27" in t.term_name]
 
         return {
             "match": {
                 "property": option.property_name,
                 "room": option.room_type,
-                "academicYear": academic_year,
-                "portalStatus": status,
-                "portalAvailable": available,
+                "academicYear": option.academic_year,
+                "termName": matching_term.term_name if matching_term else "N/A",
+                "hasSemester1": bool(semester1_terms),
             },
-            "portalOptions": options,
+            "portalState": {
+                "dublinTermCount": len([t for t in all_terms if "26/27" in t.term_name]),
+                "semester1Count": len(semester1_terms),
+                "allDublinTerms": [
+                    {
+                        "name": t.term_name,
+                        "termId": t.term_id,
+                        "startDate": t.start_date,
+                        "endDate": t.end_date,
+                        "weeks": t.weeks,
+                        "isSemester1": t.is_semester1,
+                    }
+                    for t in all_terms if "26/27" in t.term_name
+                ],
+            },
             "links": {
                 "bookingPortal": STARREZ_ENTRY_URL,
                 "propertyPage": f"{MAIN_BASE}/locations/dublin/{option.property_slug}",
+                "termLink": matching_term.booking_url if matching_term else None,
             },
             "raw": option.raw,
         }

@@ -269,27 +269,110 @@ class TestRoomOption(unittest.TestCase):
 
 
 class TestApartoScanMocked(unittest.TestCase):
-    """Test ApartoProvider.scan with mocked HTTP."""
+    """Test ApartoProvider.scan with mocked StarRez scraper."""
 
     @patch("providers.aparto._fetch")
-    @patch.object(ApartoProvider, "_session", create=True)
-    def test_scan_returns_room_options(self, _mock_session, mock_fetch):
+    def test_scan_returns_room_options_no_semester1(self, mock_fetch):
+        """When no Semester 1 terms exist, scan with filter returns 0 results."""
         mock_fetch.return_value = SAMPLE_PROPERTY_HTML
         provider = ApartoProvider()
 
-        # Mock StarRez to skip portal check
-        with patch("providers.aparto.StarRezScraper") as MockScraper:
-            instance = MockScraper.return_value
-            instance.check_semester1_availability.return_value = (False, [], "mocked")
-            results = provider.scan(academic_year="2026-27", semester=1)
+        # Mock the StarRez scraper to return only full-year terms
+        from providers.aparto import StarRezScraper, StarRezTerm
+        full_year_term = StarRezTerm(
+            term_id=1267,
+            term_name="Binary Hub - 26/27 - 41 Weeks",
+            property_name="Binary Hub",
+            start_date="29/08/2026",
+            end_date="12/06/2027",
+            start_iso="2026-08-29",
+            end_iso="2027-06-12",
+            weeks=41,
+            is_dublin=True,
+            is_semester1=False,
+            has_rooms=True,
+            booking_url="https://test.com/term/1267",
+        )
+        with patch.object(StarRezScraper, "scan_term_range", return_value=[full_year_term]):
+            results = provider.scan(academic_year="2026-27", semester=1, apply_semester_filter=True)
 
-        # 6 properties × 4 rooms each = 24 results
-        self.assertEqual(len(results), 24)
+        # With semester filter ON and no Semester 1 terms, should return 0
+        self.assertEqual(len(results), 0)
+
+    @patch("providers.aparto._fetch")
+    def test_scan_returns_all_when_semester1_available(self, mock_fetch):
+        """When Semester 1 term exists, scan returns matching rooms."""
+        mock_fetch.return_value = SAMPLE_PROPERTY_HTML
+        provider = ApartoProvider()
+
+        from providers.aparto import StarRezScraper, StarRezTerm
+        sem1_term = StarRezTerm(
+            term_id=9999,
+            term_name="Binary Hub - 26/27 - Semester 1",
+            property_name="Binary Hub",
+            start_date="29/08/2026",
+            end_date="31/01/2027",
+            start_iso="2026-08-29",
+            end_iso="2027-01-31",
+            weeks=22,
+            is_dublin=True,
+            is_semester1=True,
+            has_rooms=True,
+            booking_url="https://test.com/term/9999",
+        )
+        with patch.object(StarRezScraper, "scan_term_range", return_value=[sem1_term]):
+            results = provider.scan(academic_year="2026-27", semester=1, apply_semester_filter=True)
+
+        # Should return 4 room options (4 room types × 1 term)
+        self.assertEqual(len(results), 4)
         for r in results:
             self.assertIsInstance(r, RoomOption)
             self.assertEqual(r.provider, "aparto")
             self.assertEqual(r.academic_year, "2026-27")
-            self.assertEqual(r.option_name, "Semester 1 2026-27")
+            self.assertEqual(r.property_name, "Binary Hub")
+            self.assertTrue(r.available)
+            self.assertIn("Semester 1", r.option_name)
+
+
+class TestStarRezTermAnalysis(unittest.TestCase):
+    """Test StarRez term detection and analysis."""
+
+    def test_is_semester1_by_keyword(self):
+        from providers.aparto import _is_semester1_term
+        self.assertTrue(_is_semester1_term("Semester 1 26/27", "29/08/2026", "31/01/2027", 22))
+        self.assertTrue(_is_semester1_term("Sem 1", None, None, None))
+        self.assertFalse(_is_semester1_term("Full Year 41 Weeks", "29/08/2026", "12/06/2027", 41))
+
+    def test_is_semester1_by_duration(self):
+        from providers.aparto import _is_semester1_term
+        # Short term with correct dates but no keyword
+        self.assertTrue(_is_semester1_term("Special 22 Weeks", "29/08/2026", "31/01/2027", 22))
+        # Short term but wrong dates
+        self.assertFalse(_is_semester1_term("Special 22 Weeks", "01/02/2027", "30/06/2027", 22))
+
+    def test_is_semester1_by_iso_dates(self):
+        from providers.aparto import _is_semester1_term
+        # ISO date format with short duration
+        self.assertTrue(_is_semester1_term("Short Stay", "2026-09-01", "2027-01-31", None))
+        # Long duration should NOT match
+        self.assertFalse(_is_semester1_term("Full Year", "2026-08-29", "2027-06-12", None))
+
+    def test_is_dublin_term(self):
+        from providers.aparto import _is_dublin_term
+        self.assertTrue(_is_dublin_term("Binary Hub - 26/27 - 41 Weeks"))
+        self.assertTrue(_is_dublin_term("The Loom - 26/27 - Semester 1"))
+        self.assertFalse(_is_dublin_term("Giovenale - 26/27 - 10 months"))
+
+    def test_extract_property_name(self):
+        from providers.aparto import _extract_property_name
+        self.assertEqual(_extract_property_name("Binary Hub - 26/27 - 41 Weeks"), "Binary Hub")
+        self.assertEqual(_extract_property_name("Montrose - 26/27 - 41 weeks"), "Montrose")
+
+    def test_parse_weeks(self):
+        from providers.aparto import _parse_weeks_from_name
+        self.assertEqual(_parse_weeks_from_name("Binary Hub - 26/27 - 41 Weeks"), 41)
+        self.assertEqual(_parse_weeks_from_name("The Loom - 25/26 - 10 Week Summer"), 10)
+        self.assertIsNone(_parse_weeks_from_name("Giovenale - 26/27 - 10 months"))
 
 
 if __name__ == "__main__":

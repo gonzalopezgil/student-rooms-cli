@@ -4,12 +4,62 @@ Multi-provider student accommodation finder and monitor. Discover properties, sc
 
 Built for students hunting semester accommodation — especially when options appear unpredictably and sell out fast.
 
+## What can I do?
+
+| You're wondering… | Command | What it does |
+|---|---|---|
+| "What properties are available in Dublin?" | `student-rooms discover --provider all` | Lists all residences from every provider in your target city |
+| "Are there Semester 1 rooms in Dublin under €300/week?" | `student-rooms scan --provider all` | One-shot scan filtered by semester & your config criteria |
+| "Show me everything, not just Semester 1" | `student-rooms scan --all-options --json` | Returns all tenancy options (full year, semester 2, etc.) as JSON |
+| "Alert me the moment something opens up" | `student-rooms watch --provider all` | Continuous loop — sends a notification only when **new** options appear |
+| "Can I actually book this room right now?" | `student-rooms probe-booking --residence "Binary Hub"` | Deep-probes the booking flow and returns direct booking links |
+| "Is my notification setup working?" | `student-rooms notify --message "Test 🏠"` | Sends a test message through your configured notification backend |
+| "Does this tenancy option count as Semester 1?" | `student-rooms test-match --from-year 2026 --to-year 2027` | Tests the semester-matching logic against sample data |
+
 ## Providers
 
-| Provider | Website | Method | Coverage |
-|----------|---------|--------|----------|
-| **Yugo** | [yugo.com](https://yugo.com) | REST API | UK, Ireland, Spain, Portugal, Australia, and more |
-| **Aparto** | [apartostudent.com](https://apartostudent.com) | StarRez portal probing + site scraping | All 14 cities: Dublin, Barcelona, Paris, Milan, Florence, Aberdeen, Brighton, Bristol, Cambridge, Glasgow, Kingston, Lancaster, Oxford, Reading. Properties are discovered dynamically. |
+### Yugo
+
+| | |
+|---|---|
+| **Website** | [yugo.com](https://yugo.com) |
+| **Method** | REST API (undocumented JSON endpoints) |
+| **Coverage** | 11 countries, 70+ cities |
+
+<details>
+<summary>Full country & city list</summary>
+
+| Country | Cities |
+|---------|--------|
+| 🇺🇸 USA | Auburn, Fayetteville, Flagstaff, Tempe, Tucson, Fort Collins, Gainesville, Tallahassee, Atlanta, Kennesaw, Champaign, Urbana, West Lafayette, Lexington, Louisville, Minneapolis, Starkville, Charlotte, Greenville, Raleigh, Charleston, Cincinnati, Corvallis, Eugene, State College, Austin, College Station, Salt Lake City, Charlottesville, Pullman, Seattle, Madison |
+| 🇬🇧 UK | Birmingham, Bournemouth, Bristol, Cambridge, Cardiff, Edinburgh, Lancaster, Lincoln, Liverpool, London, Manchester, Newcastle, Norwich, Nottingham, Plymouth, Portsmouth, Sheffield, Southampton |
+| 🇮🇪 Ireland | Cork, Dublin |
+| 🇪🇸 Spain | Alcalá de Henares, Barcelona, Madrid, Salamanca, Sevilla, Valencia |
+| 🇩🇪 Germany | Darmstadt, Frankfurt, Hamburg, Leipzig, Münster |
+| 🇫🇷 France | Bordeaux, Lille, Lyon, Marseille, Paris |
+| 🇵🇹 Portugal | Porto |
+| 🇮🇹 Italy | Bologna, Florence, Padova, Turin |
+| 🇦🇹 Austria | Vienna |
+| 🇦🇺 Australia | Adelaide, Melbourne, Perth |
+| 🇦🇪 UAE | Dubai |
+
+</details>
+
+### Aparto
+
+| | |
+|---|---|
+| **Website** | [apartostudent.com](https://apartostudent.com) |
+| **Method** | StarRez portal probing + site scraping |
+| **Coverage** | 5 countries, 14 cities (properties discovered dynamically) |
+
+| Country | Cities |
+|---------|--------|
+| 🇮🇪 Ireland | Dublin |
+| 🇪🇸 Spain | Barcelona |
+| 🇮🇹 Italy | Milan, Florence |
+| 🇬🇧 UK | Aberdeen, Brighton, Bristol, Cambridge, Glasgow, Kingston, Lancaster, Oxford, Reading |
+| 🇫🇷 France | Paris *(discover only — no StarRez portal)* |
 
 ## Installation
 

@@ -311,54 +311,59 @@ def handle_watch(args: argparse.Namespace, config: Config) -> int:
         f"interval: {interval}s | academic year: {academic_year}"
     )
 
-    while True:
-        all_matches: List[RoomOption] = []
-        for p in providers:
-            try:
-                matches = p.scan(academic_year=academic_year, semester=1, apply_semester_filter=True)
-                all_matches.extend(matches)
-            except Exception as exc:
-                logger.error("Provider %s watch scan failed: %s", p.name, exc)
-
-        ranked = prioritize_matches(all_matches)
-        logger.info("Scanned %s options. Total matches: %s", len(all_matches), len(ranked))
-
-        # Detect new options not yet seen
-        new_matches = [m for m in ranked if m.dedup_key() not in seen_keys]
-
-        if new_matches:
-            logger.info("NEW options detected: %d", len(new_matches))
-            print(f"✅ NEW match(es) detected: {len(new_matches)}")
-
-            error = notifier.validate()
-            if error:
-                logger.error(error)
-            else:
-                # Try to get booking probe for top new match
-                probe = None
-                top_new = new_matches[0]
+    try:
+        while True:
+            all_matches: List[RoomOption] = []
+            for p in providers:
                 try:
-                    provider_inst = next(
-                        p for p in providers if p.name == top_new.provider
-                    )
-                    probe = provider_inst.probe_booking(top_new)
-                except (StopIteration, NotImplementedError, Exception) as exc:
-                    logger.warning("Watch probe failed: %s", exc)
+                    matches = p.scan(academic_year=academic_year, semester=1, apply_semester_filter=True)
+                    all_matches.extend(matches)
+                except Exception as exc:
+                    logger.error("Provider %s watch scan failed: %s", p.name, exc)
 
-                message = build_alert_message(new_matches, probe, is_new=True)
-                notifier.send(message)
+            ranked = prioritize_matches(all_matches)
+            logger.info("Scanned %s options. Total matches: %s", len(all_matches), len(ranked))
 
-            # Add new keys to seen set and persist
-            for m in new_matches:
-                seen_keys.add(m.dedup_key())
-            save_seen_keys(seen_keys)
+            # Detect new options not yet seen
+            new_matches = [m for m in ranked if m.dedup_key() not in seen_keys]
 
-        else:
-            print(f"  ⏳ {len(ranked)} matches, no new options. Sleeping {interval}s...")
-            logger.info("No new matches. All %d matches already seen.", len(ranked))
+            if new_matches:
+                logger.info("NEW options detected: %d", len(new_matches))
+                print(f"✅ NEW match(es) detected: {len(new_matches)}")
 
-        sleep_for = interval + random.randint(0, jitter) if jitter else interval
-        time.sleep(sleep_for)
+                error = notifier.validate()
+                if error:
+                    logger.error(error)
+                else:
+                    # Try to get booking probe for top new match
+                    probe = None
+                    top_new = new_matches[0]
+                    try:
+                        provider_inst = next(
+                            p for p in providers if p.name == top_new.provider
+                        )
+                        probe = provider_inst.probe_booking(top_new)
+                    except (StopIteration, NotImplementedError, Exception) as exc:
+                        logger.warning("Watch probe failed: %s", exc)
+
+                    message = build_alert_message(new_matches, probe, is_new=True)
+                    notifier.send(message)
+
+                # Add new keys to seen set and persist
+                for m in new_matches:
+                    seen_keys.add(m.dedup_key())
+                save_seen_keys(seen_keys)
+
+            else:
+                print(f"  ⏳ {len(ranked)} matches, no new options. Sleeping {interval}s...")
+                logger.info("No new matches. All %d matches already seen.", len(ranked))
+
+            sleep_for = interval + random.randint(0, jitter) if jitter else interval
+            time.sleep(sleep_for)
+
+    except KeyboardInterrupt:
+        print("\n⏹ Watch stopped.")
+        return 0
 
 
 def handle_probe_booking(args: argparse.Namespace, config: Config) -> int:

@@ -51,13 +51,18 @@ class YugoClient:
                 response = self.session.request(
                     method.upper(), url, params=params, data=data, timeout=self.timeout
                 )
-                if response.status_code >= 500:
+                # Client errors (4xx) are not retryable — raise immediately
+                if 400 <= response.status_code < 500:
                     response.raise_for_status()
-                if response.status_code >= 400:
+                # Server errors (5xx) are transient — retry
+                if response.status_code >= 500:
                     response.raise_for_status()
                 return response.json()
             except requests.RequestException as exc:
                 last_error = exc
+                # Don't retry client errors (4xx)
+                if hasattr(exc, 'response') and exc.response is not None and 400 <= exc.response.status_code < 500:
+                    raise
                 if attempt >= self.retries:
                     raise
                 sleep_for = self.retry_backoff_seconds * attempt

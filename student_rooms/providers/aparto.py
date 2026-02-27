@@ -29,6 +29,8 @@ from datetime import datetime
 import requests
 from bs4 import BeautifulSoup
 
+from student_rooms.matching import match_semester1
+from student_rooms.models.config import AcademicYearConfig
 from student_rooms.providers.base import BaseProvider, RoomOption
 
 logger = logging.getLogger(__name__)
@@ -106,6 +108,7 @@ CITY_SLUG_MAP: Dict[str, str] = {
 DEFAULT_TERM_SCAN_START = 1200
 DEFAULT_TERM_SCAN_END = 1600
 DEFAULT_TERM_SCAN_MAX_CONSECUTIVE_MISSES = 50
+ROOM_CACHE_TTL_SECONDS = 3600
 
 HEADERS = {
     "User-Agent": (
@@ -116,10 +119,6 @@ HEADERS = {
     "Accept-Language": "en-IE,en;q=0.9",
 }
 
-# Semester 1 detection
-SEMESTER1_KEYWORDS = ["semester 1", "sem 1", "semester1", "first semester"]
-SEMESTER1_MAX_WEEKS = 25
-FULL_YEAR_MIN_WEEKS = 35
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +184,8 @@ def _extract_rsc_json_chunks(html: str) -> List[Any]:
     """
     Extract JSON objects pushed via Next.js RSC:
       self.__next_f.push([1, '...json...'])
+
+    NOTE: kept for future-proofing if __NEXT_DATA__ extraction fails.
     """
     results = []
     pattern = re.compile(r'self\.__next_f\.push\(\[1\s*,\s*"((?:[^"\\]|\\.)*)"\]\)', re.DOTALL)
@@ -512,52 +513,56 @@ def _is_target_city_term(
     return False
 
 
-def _is_semester1_term(
-    term_name: str,
-    start_date: Optional[str],
-    end_date: Optional[str],
-    weeks: Optional[int],
-) -> bool:
-    """
-    Detect if a term is a Semester 1 option.
+def _to_iso_from_ddmmyyyy(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.strptime(value, "%d/%m/%Y")
+    except ValueError:
+        return None
+    return parsed.strftime("%Y-%m-%d")
 
-    Checks:
-    1. Name contains semester 1 keywords
-    2. Duration is <= 25 weeks (not full year)
-    3. Start date is August/September/October
-    4. End date is December/January/February
-    """
-    name_lower = term_name.lower()
 
-    # Direct keyword match
-    if any(kw in name_lower for kw in SEMESTER1_KEYWORDS):
-        return True
-
-    # Duration-based detection
-    if weeks is not None and weeks <= SEMESTER1_MAX_WEEKS:
-        if start_date and end_date:
-            try:
-                s = datetime.strptime(start_date, "%d/%m/%Y")
-                e = datetime.strptime(end_date, "%d/%m/%Y")
-                if s.month in (8, 9, 10) and e.month in (12, 1, 2):
-                    return True
-            except ValueError:
-                pass
-
-    # ISO date format fallback
-    if start_date and end_date and "-" in start_date:
+def _build_term_match_payload(term: "StarRezTerm") -> Dict[str, Any]:
+    start_iso = term.start_iso or _to_iso_from_ddmmyyyy(term.start_date)
+    end_iso = term.end_iso or _to_iso_from_ddmmyyyy(term.end_date)
+    from_year = None
+    to_year = None
+    if start_iso:
         try:
-            s = datetime.strptime(start_date, "%Y-%m-%d")
-            e = datetime.strptime(end_date, "%Y-%m-%d")
-            duration_weeks = (e - s).days / 7
-            if (duration_weeks <= SEMESTER1_MAX_WEEKS and
-                s.month in (8, 9, 10) and
-                e.month in (12, 1, 2)):
-                return True
+            from_year = int(start_iso[:4])
         except ValueError:
             pass
+    if end_iso:
+        try:
+            to_year = int(end_iso[:4])
+        except ValueError:
+            pass
+    return {
+        "fromYear": from_year,
+        "toYear": to_year,
+        "tenancyOption": [{
+            "name": term.term_name,
+            "formattedLabel": term.term_name,
+            "startDate": start_iso,
+            "endDate": end_iso,
+        }],
+    }
 
-    return False
+
+def _derive_academic_config(academic_year: Optional[str]) -> AcademicYearConfig:
+    config = AcademicYearConfig()
+    if not academic_year:
+        return config
+    try:
+        start_year, end_year = (int(y) for y in academic_year.split("-"))
+        if end_year < 100:
+            end_year = (start_year // 100) * 100 + end_year
+        config.start_year = start_year
+        config.end_year = end_year
+    except (ValueError, AttributeError):
+        pass
+    return config
 
 
 # ---------------------------------------------------------------------------
@@ -683,14 +688,6 @@ class StarRezScraper:
         property_name = _extract_property_name(term_name)
         weeks = _parse_weeks_from_name(term_name)
 
-        # For Semester 1 detection, use DD/MM/YYYY if available, else ISO
-        is_sem1 = _is_semester1_term(
-            term_name,
-            start_date or start_iso,
-            end_date or end_iso,
-            weeks,
-        )
-
         # Check for actual room listings
         has_rooms = (
             "room-result" in r.text.lower()
@@ -709,7 +706,7 @@ class StarRezScraper:
             end_iso=end_iso,
             weeks=weeks,
             is_target_city=False,  # Will be set by caller
-            is_semester1=is_sem1,
+            is_semester1=False,
             has_rooms=has_rooms,
             booking_url=r.url,
         )
@@ -737,6 +734,7 @@ class StarRezScraper:
         terms: List[StarRezTerm] = []
         consecutive_misses = 0
         last_hit_id = start_id
+        tid = start_id - 1
 
         for tid in range(start_id, end_id + 1):
             term = self.probe_term(tid)
@@ -803,15 +801,20 @@ class ApartoProvider(BaseProvider):
         self,
         city: str = "Dublin",
         country: Optional[str] = None,
+        term_id_start: int = DEFAULT_TERM_SCAN_START,
+        term_id_end: int = DEFAULT_TERM_SCAN_END,
     ):
         self._session = requests.Session()
         self._city = city.strip().title()
         self._country = country or self._resolve_country(self._city)
         self._city_slug = self._resolve_city_slug(self._city)
         self._portal_config = COUNTRY_PORTAL_MAP.get(self._country, {})
+        self._term_id_start = term_id_start
+        self._term_id_end = term_id_end
         self._discovered_properties: Optional[List[Dict[str, str]]] = None
         self._property_names: Optional[Set[str]] = None
         self._property_aliases: Optional[Dict[str, str]] = None
+        self._room_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
 
     @staticmethod
     def _resolve_country(city: str) -> str:
@@ -880,6 +883,13 @@ class ApartoProvider(BaseProvider):
 
     def _scrape_property(self, prop: Dict[str, str]) -> List[Dict[str, Any]]:
         """Scrape a single property page for room types + prices."""
+        cache_key = prop.get("slug") or prop.get("url") or prop.get("name", "")
+        cached = self._room_cache.get(cache_key)
+        if cached:
+            cached_at, cached_rooms = cached
+            if time.time() - cached_at < ROOM_CACHE_TTL_SECONDS:
+                return cached_rooms
+
         url = prop.get("url") or f"{MAIN_BASE}/locations/{self._city_slug}/{prop['slug']}"
         html = _fetch(self._session, url)
         if not html:
@@ -905,6 +915,7 @@ class ApartoProvider(BaseProvider):
                 "page_url": url,
             })
 
+        self._room_cache[cache_key] = (time.time(), rooms)
         return rooms
 
     def scan(
@@ -912,6 +923,7 @@ class ApartoProvider(BaseProvider):
         academic_year: str = "2026-27",
         semester: int = 1,
         apply_semester_filter: bool = True,
+        academic_config: Optional[AcademicYearConfig] = None,
     ) -> List[RoomOption]:
         """
         Full scan: probe StarRez termIDs + scrape main site for prices.
@@ -924,6 +936,9 @@ class ApartoProvider(BaseProvider):
         """
         self._ensure_properties_discovered()
         results: List[RoomOption] = []
+
+        if academic_config is None:
+            academic_config = _derive_academic_config(academic_year)
 
         portal_base = self._portal_config.get("portal_base")
         if not portal_base:
@@ -943,6 +958,8 @@ class ApartoProvider(BaseProvider):
             target_property_names=self._property_names,
             property_aliases=self._property_aliases,
             target_city_only=True,
+            start_id=self._term_id_start,
+            end_id=self._term_id_end,
         )
         logger.info("Aparto: found %d terms for %s", len(all_terms), self._city)
 
@@ -958,6 +975,9 @@ class ApartoProvider(BaseProvider):
                 )
             )
         ]
+
+        for term in year_terms:
+            term.is_semester1 = match_semester1(_build_term_match_payload(term), academic_config)
 
         # Apply semester filter
         if apply_semester_filter and semester == 1:
@@ -1061,7 +1081,13 @@ class ApartoProvider(BaseProvider):
             target_property_names=self._property_names,
             property_aliases=self._property_aliases,
             target_city_only=True,
+            start_id=self._term_id_start,
+            end_id=self._term_id_end,
         )
+
+        academic_config = _derive_academic_config(option.academic_year)
+        for term in all_terms:
+            term.is_semester1 = match_semester1(_build_term_match_payload(term), academic_config)
 
         term_id = option.raw.get("term_id")
         matching_term = None
